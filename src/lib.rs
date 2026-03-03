@@ -10,6 +10,7 @@ pub mod room;
 pub mod state;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use axum::Router;
 use tracing::info;
 
@@ -34,12 +35,12 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Build shared state
     let state = AppState::new(cert);
 
-    // Start UDP transport (ICE/DTLS/SRTP)
-    let udp = UdpTransport::bind().await?;
-    info!(
-        "ICE credentials: ufrag={}, pwd={}",
-        udp.ice_creds.ufrag, udp.ice_creds.pwd
-    );
+    // Start UDP transport (shares RoomHub + ServerCert with signaling)
+    let udp = UdpTransport::bind(
+        Arc::clone(&state.rooms),
+        Arc::clone(&state.cert),
+    ).await?;
+    info!("UDP listening on port {}", config::UDP_PORT);
 
     tokio::spawn(async move {
         udp.run().await;

@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.3] - 2026-03-03
+
+### Added
+- UDP transport ↔ RoomHub full integration
+- STUN cold path: `parse()` → `latch_by_ufrag()` → MESSAGE-INTEGRITY verify → Binding Response
+- USE-CANDIDATE triggers DTLS handshake (10s timeout, spawned async task)
+- DTLS complete → `export_srtp_keys()` → `participant.install_srtp_keys()`
+- SRTP hot path: `find_by_addr()` O(1) → decrypt → fan-out → encrypt → send_to
+- RTCP detection (RFC 5761 PT 72-79): decrypt for logging, not relayed
+- DemuxConn channel switched to `Bytes` (reduced heap allocation)
+- Periodic stale DTLS session cleanup (every 1000 packets)
+- DTLSConn keepalive recv loop (prevents session drop)
+
+### Changed
+- UDP transport no longer uses standalone IceCredentials — all lookup via RoomHub
+- Signaling handler: cleaned unused imports, fixed socket variable naming
+
 ## [0.1.2] - 2026-03-03
 
 ### Added

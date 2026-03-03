@@ -18,10 +18,9 @@ use axum::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
-use crate::error::LightError;
 use crate::room::participant::Participant;
 use crate::signaling::message::*;
 use crate::signaling::opcode;
@@ -90,32 +89,26 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Spawn egress task: ws_rx → WebSocket
-    let (mut ws_sender, mut ws_receiver) = (socket, );
-    // Actually we need split — but axum WS doesn't have split().
-    // Use a simpler pattern: single loop with select.
-
-    // For now, use the simpler single-loop pattern (no split needed).
+    // Single loop with select: no split needed at our scale (20 participants).
     // Server-initiated events go through ws_tx → checked in the loop.
-    // This is fine for our scale (20 participants).
 
     loop {
         tokio::select! {
             // Outbound: server events queued via ws_tx
             Some(json) = ws_rx.recv() => {
-                if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                if socket.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
             }
             // Inbound: client messages
-            msg = ws_sender.recv() => {
+            msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         let text_str: &str = &text;
                         match serde_json::from_str::<Packet>(text_str) {
                             Ok(packet) => {
                                 if let Some(resp) = dispatch(&mut session, &state, packet).await {
-                                    if send_packet(&mut ws_sender, &resp).await.is_err() {
+                                    if send_packet(&mut socket, &resp).await.is_err() {
                                         break;
                                     }
                                 }
@@ -313,7 +306,7 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
     let user_id = session.user_id.as_ref().unwrap();
 
     match state.rooms.remove_participant(&req.room_id, user_id) {
-        Ok(p) => {
+        Ok(_p) => {
             info!("ROOM_LEAVE user={} room={}", user_id, req.room_id);
 
             // Notify remaining participants

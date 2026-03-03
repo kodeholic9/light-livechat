@@ -31,33 +31,37 @@
 - [x] MESSAGE relay (MESSAGE_EVENT)
 - [x] ICE_CANDIDATE (trickle — acknowledged, ignored in ICE-Lite)
 
-## Phase 2: UDP ↔ RoomHub Integration ← NEXT
-- [ ] STUN handler uses RoomHub.latch_by_ufrag() instead of per-transport credentials
-- [ ] ICE USE-CANDIDATE → trigger DTLS handshake for participant
-- [ ] DTLS handshake complete → install SRTP keys on Participant
-- [ ] SRTP handler: find_by_addr() → decrypt → relay to room → encrypt → send
-- [ ] RTCP passthrough (decrypt for logging, no relay)
-- [ ] AppState shared between WS handlers and UDP transport
+## Phase 2: UDP ↔ RoomHub Integration ✅
+- [x] STUN handler uses RoomHub.latch_by_ufrag() (per-participant ICE credentials)
+- [x] MESSAGE-INTEGRITY verification with participant's ice_pwd
+- [x] USE-CANDIDATE → trigger DTLS handshake (10s timeout, async spawn)
+- [x] DTLS handshake complete → export_srtp_keys() → install on Participant
+- [x] SRTP hot path: find_by_addr() O(1) → decrypt → fan-out → encrypt → send
+- [x] RTCP detection (RFC 5761 PT demux), decrypt for logging, no relay
+- [x] DemuxConn channel switched to Bytes
+- [x] DTLSConn keepalive recv loop
+- [x] Stale DTLS session cleanup
+- [x] AppState shared between WS handlers and UDP transport
 
-## Phase 3: RTP Routing (Media Pipeline)
-- [ ] RTP header parsing (SSRC, PT, sequence, timestamp)
-- [ ] Fan-out: sender → all subscribers in room (exclude sender)
-- [ ] SSRC rewrite (optional, for simulcast/SVC prep)
-- [ ] Hot-path optimization (minimize allocations)
-
-## Phase 4: Full SDP Negotiation
-- [ ] SDP Offer parsing (webrtc-sdp or hand-rolled)
-- [ ] SDP Answer generation (ICE-Lite, DTLS fingerprint, codec mirror)
+## Phase 3: SDP Negotiation ← NEXT
+- [ ] SDP Offer parsing (extract codecs, SSRC, mid, ice-ufrag, fingerprint)
+- [ ] SDP Answer generation (ICE-Lite params, DTLS fingerprint, codec mirror)
 - [ ] Track registration from SDP (SSRC → TrackKind mapping)
-- [ ] Renegotiation (SDP_OFFER opcode → re-answer)
-- [ ] TRACK_EVENT notification to room participants
+- [ ] ROOM_JOIN flow: Offer → Answer → ICE → DTLS → SRTP (end-to-end)
+- [ ] Browser integration test (video only, 2 tabs)
+
+## Phase 4: RTP Routing Refinement
+- [ ] RTP header parsing (SSRC, PT, sequence, timestamp)
+- [ ] SSRC rewrite (optional, for simulcast/SVC prep)
+- [ ] Hot-path optimization (minimize allocations, Bytes zero-copy)
+- [ ] Bandwidth estimation (basic)
 
 ## Phase 5: Hardening
 - [ ] IDENTIFY token verification (JWT or shared secret)
 - [ ] Zombie session reaper (last_seen timeout)
 - [ ] ACK miss counter → connection termination
 - [ ] Heartbeat timeout → disconnect
-- [ ] DTLS handshake timeout
+- [ ] DTLS handshake timeout cleanup
 - [ ] Graceful shutdown (drain connections)
 - [ ] Structured logging & metrics
 
@@ -65,7 +69,7 @@
 - [ ] Room mode field (Conference / PTT)
 - [ ] Floor control state machine (Idle → Taken → Idle)
 - [ ] FLOOR_REQUEST / FLOOR_RELEASE opcodes
-- [ ] Relay gate: only floor holder's media is forwarded in PTT mode
+- [ ] Relay gate: only floor holder's media forwarded in PTT mode
 - [ ] Floor indicator broadcast
 
 ## Phase 7: Simulcast / SVC (Optional)
@@ -74,6 +78,7 @@
 - [ ] Adaptive quality switching
 
 ## Backlog
+- [ ] Renegotiation (track add/remove without re-join)
 - [ ] TURN relay support (for restrictive NATs)
 - [ ] Recording (RTP → file)
 - [ ] Data channel support

@@ -2,8 +2,8 @@
 //! Global configuration constants
 
 // --- Server ---
-pub const WS_PORT: u16 = 8080;
-pub const UDP_PORT: u16 = 10000;
+pub const WS_PORT: u16 = 1974;
+pub const UDP_PORT: u16 = 19740;
 
 // --- Heartbeat ---
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;

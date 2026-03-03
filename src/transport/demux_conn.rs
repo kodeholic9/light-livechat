@@ -6,9 +6,10 @@
 //!       │
 //!       ├── STUN → ICE handler (direct)
 //!       ├── DTLS → mpsc channel → DemuxConn → DTLSConn
-//!       └── SRTP → media pipeline (later)
+//!       └── SRTP → media pipeline
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,13 +18,13 @@ use tokio::sync::{mpsc, Mutex};
 use webrtc_util::conn::Conn;
 
 /// Inbound DTLS packet sender (held by UDP recv loop)
-pub type DtlsPacketTx = mpsc::Sender<Vec<u8>>;
+pub type DtlsPacketTx = mpsc::Sender<Bytes>;
 
 /// Virtual connection for a single participant's DTLS session.
 pub struct DemuxConn {
     socket:    Arc<UdpSocket>,
     peer_addr: SocketAddr,
-    rx:        Mutex<mpsc::Receiver<Vec<u8>>>,
+    rx:        Mutex<mpsc::Receiver<Bytes>>,
 }
 
 impl DemuxConn {
