@@ -11,11 +11,12 @@
 //! latching 후에는 sockaddr → (user_id, PcType) 매핑으로 O(1) 식별.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::trace;
 
+use crate::config;
 use crate::transport::srtp::SrtpContext;
 
 // ============================================================================
@@ -65,6 +66,8 @@ pub struct Track {
     pub ssrc: u32,
     pub kind: TrackKind,
     pub track_id: String,
+    /// RTX SSRC (video only, RFC 4588)
+    pub rtx_ssrc: Option<u32>,
 }
 
 // ============================================================================
@@ -126,6 +129,50 @@ impl MediaSession {
 }
 
 // ============================================================================
+// RtpCache — 비디오 RTP 링버퍼 캐시 (NACK → RTX 재전송용)
+// ============================================================================
+
+/// Publisher의 비디오 RTP plaintext를 캐시.
+/// subscriber가 NACK을 보내면 캐시에서 찾아 RTX로 재전송한다.
+/// 고정 크기 링버퍼, key = seq % SIZE. 오래된 패킷은 자연 덮어쓰기.
+pub struct RtpCache {
+    slots: Vec<Option<Vec<u8>>>,
+}
+
+impl RtpCache {
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(config::RTP_CACHE_SIZE);
+        slots.resize_with(config::RTP_CACHE_SIZE, || None);
+        Self { slots }
+    }
+
+    /// RTP plaintext 저장 (seq로 인덱싱)
+    pub fn store(&mut self, seq: u16, plaintext: &[u8]) {
+        let idx = (seq as usize) % config::RTP_CACHE_SIZE;
+        self.slots[idx] = Some(plaintext.to_vec());
+    }
+
+    /// seq로 캐시된 RTP 조회
+    pub fn get(&self, seq: u16) -> Option<&[u8]> {
+        let idx = (seq as usize) % config::RTP_CACHE_SIZE;
+        self.slots[idx].as_ref().and_then(|pkt| {
+            // seq 검증: 캐시된 패킷의 seq가 요청한 seq와 일치하는지 확인
+            if pkt.len() >= config::RTP_HEADER_MIN_SIZE {
+                let cached_seq = u16::from_be_bytes([pkt[2], pkt[3]]);
+                if cached_seq == seq {
+                    return Some(pkt.as_slice());
+                }
+            }
+            None
+        })
+    }
+}
+
+impl Default for RtpCache {
+    fn default() -> Self { Self::new() }
+}
+
+// ============================================================================
 // Participant — 2PC 세션 소유
 // ============================================================================
 
@@ -149,6 +196,14 @@ pub struct Participant {
     // --- tracks ---
     /// 이 참가자가 publish하는 트랙 목록 (publish_tracks 메시지로 등록)
     pub tracks: Mutex<Vec<Track>>,
+
+    // --- RTX (RFC 4588) ---
+    /// 비디오 RTP 캐시 (NACK → RTX 재전송용)
+    pub rtp_cache: Mutex<RtpCache>,
+    /// RTX SSRC 할당용 카운터 (참가자별 고유)
+    rtx_ssrc_counter: AtomicU32,
+    /// RTX 패킷 전용 seq 카운터 (subscriber별이 아닌 publisher별)
+    pub rtx_seq: AtomicU16,
 }
 
 impl Participant {
@@ -175,6 +230,9 @@ impl Participant {
             publish:    MediaSession::new(pub_ufrag, pub_pwd),
             subscribe:  MediaSession::new(sub_ufrag, sub_pwd),
             tracks:     Mutex::new(Vec::new()),
+            rtp_cache:  Mutex::new(RtpCache::new()),
+            rtx_ssrc_counter: AtomicU32::new(0),
+            rtx_seq:    AtomicU16::new(0),
         }
     }
 
@@ -190,13 +248,29 @@ impl Participant {
         }
     }
 
-    /// 트랙 등록 (SSRC 중복 방지)
+    /// 트랙 등록 (SSRC 중복 방지). video 트랙은 RTX SSRC 자동 할당.
     pub fn add_track(&self, ssrc: u32, kind: TrackKind, track_id: String) {
         let mut tracks = self.tracks.lock().unwrap();
         if !tracks.iter().any(|t| t.ssrc == ssrc) {
-            tracks.push(Track { ssrc, kind, track_id });
-            trace!("track added ssrc={} user={}", ssrc, self.user_id);
+            let rtx_ssrc = if kind == TrackKind::Video {
+                Some(self.alloc_rtx_ssrc(ssrc))
+            } else {
+                None
+            };
+            tracks.push(Track { ssrc, kind, track_id, rtx_ssrc });
+            trace!("track added ssrc={} rtx_ssrc={:?} user={}", ssrc, rtx_ssrc, self.user_id);
         }
+    }
+
+    /// RTX SSRC 할당: media_ssrc + 1000 + counter (충돌 회피)
+    fn alloc_rtx_ssrc(&self, media_ssrc: u32) -> u32 {
+        let offset = self.rtx_ssrc_counter.fetch_add(1, Ordering::Relaxed);
+        media_ssrc.wrapping_add(1000).wrapping_add(offset)
+    }
+
+    /// 다음 RTX seq 번호 발급
+    pub fn next_rtx_seq(&self) -> u16 {
+        self.rtx_seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// 트랙 제거 (SSRC 기준)

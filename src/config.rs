@@ -32,6 +32,16 @@ pub const DEMUX_RTP_MAX: u8 = 0xBF;
 pub const RTP_HEADER_MIN_SIZE: usize = 12;
 pub const UDP_RECV_BUF_SIZE: usize = 2048;
 
+// --- RTX (RFC 4588) ---
+/// RTP 캐시 링버퍼 크기 (seq % SIZE로 인덱싱, 약 4초분 @30fps)
+pub const RTP_CACHE_SIZE: usize = 128;
+/// RTX payload type (server_codec_policy의 rtx_pt와 일치해야 함)
+pub const RTX_PAYLOAD_TYPE: u8 = 97;
+/// NACK RTCP payload type (RFC 4585, Generic NACK)
+pub const RTCP_PT_NACK: u8 = 205;
+/// NACK feedback message type (FMT=1)
+pub const RTCP_FMT_NACK: u8 = 1;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

@@ -314,13 +314,9 @@ impl UdpTransport {
 
         sender.touch(current_ts());
 
-        // Only process media from publish PC
+        // Subscribe PC에서 오는 패킷: RTCP feedback (NACK 등)
         if pc_type != PcType::Publish {
-            // Subscribe PC에서 오는 SRTP는 RTCP feedback (future Phase)
-            if seq_num < config::DBG_DETAIL_LIMIT {
-                trace!("[DBG:RTP] from subscribe PC user={} addr={} (RTCP feedback — ignored)",
-                    sender.user_id, remote);
-            }
+            self.handle_subscribe_rtcp(buf, remote, &sender, &room, seq_num).await;
             return;
         }
 
@@ -376,6 +372,14 @@ impl UdpTransport {
         let rtp_hdr = parse_rtp_header(&plaintext);
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
         let is_summary = seq_num > 0 && seq_num % config::DBG_SUMMARY_INTERVAL == 0;
+
+        // 비디오 RTP 캐시 (NACK → RTX 재전송용, audio는 skip)
+        // PT 96 = VP8 (server_codec_policy)
+        if rtp_hdr.pt == 96 {
+            if let Ok(mut cache) = sender.rtp_cache.lock() {
+                cache.store(rtp_hdr.seq, &plaintext);
+            }
+        }
 
         if is_detail {
             info!("[DBG:RTP] #{} user={} ssrc=0x{:08X} pt={} seq={} ts={} marker={} payload_len={}",
@@ -442,6 +446,267 @@ impl UdpTransport {
                 seq_num, sender.user_id, rtp_hdr.ssrc, relay_count);
         }
     }
+
+    // ========================================================================
+    // Subscribe RTCP — NACK 파싱 + RTX 재전송 (Phase C)
+    // ========================================================================
+
+    /// Subscribe PC에서 수신된 RTCP 처리 (NACK → RTX 재전송)
+    async fn handle_subscribe_rtcp(
+        &self,
+        buf: &[u8],
+        remote: SocketAddr,
+        subscriber: &Arc<crate::room::participant::Participant>,
+        room: &Arc<crate::room::room::Room>,
+        seq_num: u64,
+    ) {
+        let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
+
+        // RTCP인지 확인 (RFC 5761: PT 72-79)
+        let is_rtcp = buf.get(1)
+            .map(|b| { let pt = b & 0x7F; (72..=79).contains(&pt) })
+            .unwrap_or(false);
+
+        if !is_rtcp {
+            if is_detail {
+                trace!("[DBG:SUB] non-RTCP from subscribe PC user={} addr={}",
+                    subscriber.user_id, remote);
+            }
+            return;
+        }
+
+        // Subscribe session의 inbound_srtp로 decrypt
+        let plaintext = {
+            let mut ctx = subscriber.subscribe.inbound_srtp.lock().unwrap();
+            match ctx.decrypt_rtcp(buf) {
+                Ok(p) => p,
+                Err(e) => {
+                    if is_detail {
+                        info!("[DBG:NACK] SRTCP decrypt FAILED user={} addr={}: {e}",
+                            subscriber.user_id, remote);
+                    }
+                    return;
+                }
+            }
+        };
+
+        // RTCP compound 패킷 내에서 NACK (PT=205, FMT=1) 찾기
+        let nack_items = parse_rtcp_nack(&plaintext);
+        if nack_items.is_empty() {
+            if is_detail {
+                let rtcp_pt = plaintext.get(1).map(|b| b & 0x7F).unwrap_or(0);
+                trace!("[DBG:SUB] RTCP (non-NACK) pt={} user={}", rtcp_pt, subscriber.user_id);
+            }
+            return;
+        }
+
+        // NACK에서 요청한 seq 목록 추출
+        for nack in &nack_items {
+            let lost_seqs = expand_nack(nack.pid, nack.blp);
+
+            if is_detail {
+                info!("[DBG:NACK] user={} media_ssrc=0x{:08X} pid={} blp=0x{:04X} seqs={:?}",
+                    subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
+            }
+
+            // 해당 media_ssrc의 publisher 찾기
+            let publisher = room.all_participants().into_iter()
+                .find(|p| {
+                    p.get_tracks().iter().any(|t| t.ssrc == nack.media_ssrc)
+                });
+
+            let publisher = match publisher {
+                Some(p) => p,
+                None => {
+                    if is_detail {
+                        info!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
+                    }
+                    continue;
+                }
+            };
+
+            // RTX SSRC 찾기
+            let rtx_ssrc = publisher.get_tracks().iter()
+                .find(|t| t.ssrc == nack.media_ssrc)
+                .and_then(|t| t.rtx_ssrc);
+
+            let rtx_ssrc = match rtx_ssrc {
+                Some(s) => s,
+                None => {
+                    if is_detail {
+                        info!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
+                    }
+                    continue;
+                }
+            };
+
+            // subscriber의 subscribe addr
+            let sub_addr = match subscriber.subscribe.get_address() {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // 캐시 조회 + RTX 조립 (lock 내에서 완료, await 전에 drop)
+            let rtx_packets: Vec<(u16, u16, Vec<u8>)> = {
+                let cache = publisher.rtp_cache.lock().unwrap();
+                lost_seqs.iter().filter_map(|&lost_seq| {
+                    let original = cache.get(lost_seq)?;
+                    let rtx_seq = publisher.next_rtx_seq();
+                    let rtx_pkt = build_rtx_packet(original, rtx_ssrc, rtx_seq);
+                    Some((lost_seq, rtx_seq, rtx_pkt))
+                }).collect()
+            }; // cache lock dropped here
+
+            if is_detail && rtx_packets.len() < lost_seqs.len() {
+                trace!("[DBG:RTX] cache miss {}/{} seqs for ssrc=0x{:08X}",
+                    lost_seqs.len() - rtx_packets.len(), lost_seqs.len(), nack.media_ssrc);
+            }
+
+            for (lost_seq, rtx_seq, rtx_pkt) in &rtx_packets {
+                // subscriber의 subscribe session outbound_srtp로 암호화
+                let encrypted = {
+                    let mut ctx = subscriber.subscribe.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtp(rtx_pkt) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if is_detail {
+                                info!("[DBG:RTX] encrypt FAILED seq={}: {e}", lost_seq);
+                            }
+                            continue;
+                        }
+                    }
+                };
+
+                if let Err(e) = self.socket.send_to(&encrypted, sub_addr).await {
+                    if is_detail {
+                        info!("[DBG:RTX] send FAILED seq={} addr={}: {e}", lost_seq, sub_addr);
+                    }
+                } else if is_detail {
+                    info!("[DBG:RTX] sent seq={} rtx_seq={} rtx_ssrc=0x{:08X} → user={} addr={}",
+                        lost_seq, rtx_seq, rtx_ssrc, subscriber.user_id, sub_addr);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// NACK 파싱 (RFC 4585 Generic NACK)
+// ============================================================================
+
+/// NACK FCI (Feedback Control Information) 항목
+struct NackItem {
+    media_ssrc: u32,
+    pid: u16,
+    blp: u16,
+}
+
+/// RTCP compound 패킷에서 Generic NACK (PT=205, FMT=1) 항목 추출
+///
+/// RTCP 패킷 구조 (RFC 4585):
+///   Byte 0: V=2, P, FMT (5bit)
+///   Byte 1: PT (8bit)
+///   Bytes 2-3: length (32-bit words - 1)
+///   Bytes 4-7: SSRC of sender
+///   Bytes 8-11: SSRC of media source
+///   Bytes 12+: FCI (pid:16 + blp:16) × N
+fn parse_rtcp_nack(buf: &[u8]) -> Vec<NackItem> {
+    let mut items = Vec::new();
+    let mut offset = 0;
+
+    while offset + 4 <= buf.len() {
+        if buf.len() < offset + 4 { break; }
+
+        let fmt = buf[offset] & 0x1F;
+        let pt  = buf[offset + 1];
+        let length_words = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let pkt_len = (length_words + 1) * 4;
+
+        if pt == config::RTCP_PT_NACK && fmt == config::RTCP_FMT_NACK {
+            // Generic NACK
+            if offset + 12 <= buf.len() {
+                let media_ssrc = u32::from_be_bytes([
+                    buf[offset + 8], buf[offset + 9],
+                    buf[offset + 10], buf[offset + 11],
+                ]);
+
+                // FCI: (pid:16 + blp:16) × N
+                let fci_start = offset + 12;
+                let fci_end = (offset + pkt_len).min(buf.len());
+                let mut fci_off = fci_start;
+                while fci_off + 4 <= fci_end {
+                    let pid = u16::from_be_bytes([buf[fci_off], buf[fci_off + 1]]);
+                    let blp = u16::from_be_bytes([buf[fci_off + 2], buf[fci_off + 3]]);
+                    items.push(NackItem { media_ssrc, pid, blp });
+                    fci_off += 4;
+                }
+            }
+        }
+
+        offset += pkt_len;
+        if pkt_len == 0 { break; } // safety
+    }
+
+    items
+}
+
+/// NACK PID + BLP → 손실 seq 목록 확장
+///
+/// PID = 첫 번째 손실 seq
+/// BLP = 비트마스크, bit i 설정 → (PID + i + 1) 손실
+fn expand_nack(pid: u16, blp: u16) -> Vec<u16> {
+    let mut seqs = vec![pid];
+    for i in 0..16u16 {
+        if blp & (1 << i) != 0 {
+            seqs.push(pid.wrapping_add(i + 1));
+        }
+    }
+    seqs
+}
+
+// ============================================================================
+// RTX 패킷 조립 (RFC 4588)
+// ============================================================================
+
+/// 원본 RTP plaintext → RTX 패킷 조립
+///
+/// RTX 패킷 구조:
+///   - RTP 헤더: V/P/X/CC 동일, M=0, PT=97(RTX), seq=rtx_seq, ts=원본, SSRC=rtx_ssrc
+///   - 페이로드: [원본 seq 2바이트 big-endian] + [원본 RTP 페이로드]
+fn build_rtx_packet(original: &[u8], rtx_ssrc: u32, rtx_seq: u16) -> Vec<u8> {
+    if original.len() < config::RTP_HEADER_MIN_SIZE {
+        return Vec::new();
+    }
+
+    let cc = (original[0] & 0x0F) as usize;
+    let header_len = 12 + cc * 4;
+    if original.len() < header_len {
+        return Vec::new();
+    }
+
+    let orig_seq = u16::from_be_bytes([original[2], original[3]]);
+    let payload = &original[header_len..];
+
+    // RTX 패킷 = header(12+cc*4) + orig_seq(2) + payload
+    let mut rtx = Vec::with_capacity(header_len + 2 + payload.len());
+
+    // RTP header 복사 (V/P/X/CC 유지)
+    rtx.extend_from_slice(&original[..header_len]);
+
+    // PT → RTX (97), M=0
+    rtx[1] = config::RTX_PAYLOAD_TYPE;
+
+    // seq → rtx_seq
+    rtx[2..4].copy_from_slice(&rtx_seq.to_be_bytes());
+
+    // SSRC → rtx_ssrc
+    rtx[8..12].copy_from_slice(&rtx_ssrc.to_be_bytes());
+
+    // OSN (Original Sequence Number) + 원본 페이로드
+    rtx.extend_from_slice(&orig_seq.to_be_bytes());
+    rtx.extend_from_slice(payload);
+
+    rtx
 }
 
 // ============================================================================

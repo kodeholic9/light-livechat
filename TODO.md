@@ -95,10 +95,11 @@
 - [ ] 기존 기능 회귀 테스트 (audio relay, 정상 퇴장 등)
 
 ## Phase B: 통합 테스트 + 다중 참가자
-- [ ] 3명 이상 동시 접속 테스트
+- [x] 3명 동시 접속 테스트 — 영상+오디오 양방향 확인
+- [x] app.js 다중 참가자 비디오 대응 (remoteStreams Map + userId 매핑)
+- [x] app.js 다중 참가자 오디오 대응 (참가자별 <audio> 엘리먼트)
 - [ ] 참가자 중간 퇴장 → inactive m-line 처리 확인
 - [ ] 재입장 → 슬롯 재활용 확인
-- [ ] app.js tryAttachRemoteVideo() 다중 참가자 대응 개선
 - [ ] subscribe PC 사전 생성 옵션 검토 (joinRoom 시점)
 
 ## Phase C: RTCP + 안정화

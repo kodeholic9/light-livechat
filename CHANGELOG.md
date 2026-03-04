@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-03-04
+
+### Added (Phase C: NACK-based RTX Retransmission)
+
+#### 서버 (light-livechat)
+- **RtpCache** — 비디오 RTP plaintext 링버퍼 캐시 (128슬롯, seq % 128 인덱싱)
+  - `participant.rs`에 `RtpCache` 구조체 추가 (`store()`, `get()` + seq 검증)
+  - `Participant`에 `rtp_cache: Mutex<RtpCache>` 필드 추가
+  - `udp.rs` hot path: VP8(PT=96) decrypt 후 캐시 저장
+- **NACK 파싱** (RFC 4585 Generic NACK, PT=205, FMT=1)
+  - `parse_rtcp_nack()` — RTCP compound 패킷에서 NACK FCI 추출
+  - `expand_nack(pid, blp)` — PID + BLP 비트마스크 → 손실 seq 목록
+  - Subscribe PC RTCP 처리: `handle_subscribe_rtcp()` 메서드 신설
+- **RTX 패킷 조립** (RFC 4588)
+  - `build_rtx_packet()` — PT=97, rtx_ssrc, OSN(2바이트) + 원본 페이로드
+  - Publisher별 `rtx_seq: AtomicU16` 카운터
+  - 캐시 조회 → RTX 조립 → subscribe outbound SRTP 암호화 → send_to
+- **RTX SSRC 자동 할당**
+  - `Track.rtx_ssrc: Option<u32>` 필드 추가 (video only)
+  - `add_track()`: video 트랙 등록 시 `media_ssrc + 1000 + counter`로 RTX SSRC 할당
+  - `tracks_update`, `ROOM_JOIN` 응답에 `rtx_ssrc` 필드 포함
+- **config.rs** 상수 추가: `RTP_CACHE_SIZE`(128), `RTX_PAYLOAD_TYPE`(97), `RTCP_PT_NACK`(205), `RTCP_FMT_NACK`(1)
+- 로그 태그: `[DBG:NACK]`, `[DBG:RTX]`, `[DBG:SUB]`
+
+#### 클라이언트 (insight-lens)
+- **sdp-builder.mjs**: subscribe SDP video m-line에 RTX SSRC 선언
+  - `a=ssrc-group:FID {video_ssrc} {rtx_ssrc}`
+  - `a=ssrc:{rtx_ssrc} cname:light-sfu`
+- SDK: 서버가 보내는 `rtx_ssrc` 필드가 spread로 자동 전달됨 (별도 수정 불필요)
+
+### 목적
+- 패킷 손실 시 Chrome NACK → 서버 캐시에서 RTX 재전송 (publisher 관여 없이 RTT 절반)
+- 비디오 화질 안정성 향상 (블록 노이즈, 프레임 깨짐 감소)
+
+### 확인 방법
+- 서버 로그: `[DBG:NACK]` (손실 감지) + `[DBG:RTX]` (재전송)
+- Chrome `chrome://webrtc-internals`: subscribe PC inbound-rtp의 `nackCount`, `packetsLost`
+- 인위적 테스트: clumsy 등으로 UDP 패킷 drop → NACK 빈발 → RTX 동작 확인
+
 ## [0.1.7] - 2026-03-04
 
 ### Added (Phase A-3: PLI Keyframe Request)

@@ -185,11 +185,13 @@ async-trait = "0.1"
 | 2 | UDP ↔ RoomHub 통합 (전체 파이프라인) | 0.1.3 | ✅ |
 | 3 | SDP Negotiation (브라우저 연동) | 0.1.4 | ✅ |
 | 3.5 | 디버그 로그 + 영상 렌더링 수정 | 0.1.4 | ✅ |
-| A-1 | **2PC / SDP-free 아키텍처 전환** | 0.1.5 | ✅ |
-| A-2 | 클라이언트 SdpBuilder (fake SDP 조립) | 0.1.6 | |
-| B | 통합 테스트 (1:1 → 3명 conference) | 0.1.7 | |
-| C | RTCP 릴레이 + PLI + mute/unmute | 0.1.8 | |
-| D | Hardening (인증, 좀비, 타임아웃) | 0.1.9 | |
+| A-1 | 2PC / SDP-free 아키텍처 전환 | 0.1.5 | ✅ |
+| A-2 | 클라이언트 SdpBuilder (fake SDP 조립) | 0.1.6 | ✅ |
+| A-3 | PLI keyframe request (subscribe ready → PLI) | 0.1.7 | ✅ |
+| B | Multi-party 스트림 매핑 + SDP mid 안정화 | 0.1.8 | ✅ |
+| B-2 | BUNDLE demux 수정 + inactive m-line 처리 | 0.1.9 | ✅ |
+| C | NACK 기반 RTX 재전송 (서버 캐시) | 0.2.0 | ✅ |
+| D | Hardening (인증, 좀비, 타임아웃) | - | |
 | E | PTT 지원 | 0.2.0 | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -215,7 +217,112 @@ async-trait = "0.1"
 
 ---
 
-## 10. 주의사항
+## 10. 버전 변경 이력 (v0.1.5+)
+
+### v0.1.5 — 2PC / SDP-free 아키텍처 전환
+- 서버: SDP 완전 제거, server_config(JSON) 응답으로 전환
+- 클라이언트: publish PC + subscribe PC 분리 (2PC)
+- SdpBuilder: server_config → fake remote SDP 조립
+
+### v0.1.7 — PLI keyframe request
+- 서버: `build_pli()` (RFC 4585, 12바이트) + `SrtpContext::encrypt_rtcp()`
+- subscribe SRTP ready 시점에 모든 publisher에게 PLI 전송
+- 비디오 표시 지연: 10-20초 → 1-2초
+
+### v0.1.8 — Multi-party + SDP mid 안정화
+- 클라이언트: `remoteStreams: Map<userId, MediaStream>` 다중 스트림 매핑
+- 참가자별 `<audio>` 요소 독립 생성 (브라우저 자동 믹싱)
+- `_nextMid` 카운터: mid 순차 할당, 재사용 시 기존 mid 유지
+- inactive m-line: `active: false` + mid 보존 (SDP m-line 삭제 불가 규칙)
+
+### v0.2.0 — NACK 기반 RTX 재전송 (Phase C)
+- 서버: `RtpCache` 링버퍼(128) + NACK 파싱(PT=205) + RTX 조립(RFC 4588, PT=97)
+- 서버: `handle_subscribe_rtcp()` — subscribe PC RTCP 처리 분기 신설
+- 서버: Track에 `rtx_ssrc` 필드, video 트랙 등록 시 자동 할당
+- 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
+- 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
+- publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.1.9 — BUNDLE demux + inactive m-line 처리
+- subscribe SDP에서 `sdes:mid` extmap 제거 (서버가 RTP mid 헤더 rewrite 안 함)
+  - Chrome BUNDLE demux를 SSRC 기반으로 fallback
+- inactive(port=0) m-line을 BUNDLE 그룹에서 제외
+  - Chrome re-nego 시 "should be rejected" 에러 해결
+- SDP validation: BUNDLE/mid 수 불일치 검증 제거 (의도적 불일치)
+
+---
+
+## 11. 주요 기술 패턴 (subscribe SDP)
+
+### BUNDLE 그룹 규칙
+- active(sendonly) m-line만 BUNDLE에 포함
+- inactive(port=0) m-line은 BUNDLE에서 제외
+- 모든 m-line이 inactive면 첫 번째 mid를 BUNDLE에 넣음 (SDP 유효성)
+
+### Mid 할당 전략
+- `_nextMid` 카운터: 새 트랙 추가 시만 increment, 절대 reset 안 함 (room exit 제외)
+- 트랙 제거: `active: false` 로 변경, mid 보존
+- 트랙 재활성화: 같은 track_id면 기존 mid 재사용
+
+### Demux 방식
+- subscribe SDP에서 `sdes:mid` extmap 제거
+- Chrome이 SSRC 기반 demux로 fallback
+- 각 m-line에 SSRC 선언 필수 (sendonly 시)
+
+### PLI 패킷 구조 (12바이트)
+```
+Byte 0: 0x81 (V=2, P=0, FMT=1)
+Byte 1: 0xCE (PT=206 PSFB)
+Bytes 2-3: 0x0002 (length=2)
+Bytes 4-7: 0x00000000 (sender SSRC)
+Bytes 8-11: media_ssrc (big-endian)
+```
+
+---
+
+## 12. Phase C 설계 (NACK 기반 RTX 재전송) — ✅ 구현 완료 (v0.2.0)
+
+### 개요
+- subscriber Chrome이 패킷 손실 감지 → NACK 전송 → 서버가 캐시에서 RTX 재전송
+- publisher 관여 없이 서버에서 직접 처리 (RTT 절반)
+
+### 서버 측
+
+**C-1. RtpCache (SSRC별 링버퍼)**
+- `Vec<Option<Vec<u8>>>` 고정 크기 128
+- key = `seq % 128`, publisher RTP decrypt 후 저장
+- 오래된 패킷은 덮어쓰기로 자연 제거
+- SSRC당 1개, 비디오만 (audio는 NACK 불필요)
+
+**C-2. NACK 파싱**
+- subscriber subscribe PC에서 오는 RTCP (PT=205, FMT=1)
+- Generic NACK: PID(16bit) + BLP(16bit 비트마스크) → 손실 seq 목록 추출
+- 현재 `handle_srtp()`에서 subscribe PC RTCP를 무시 → NACK 파싱으로 변경
+
+**C-3. RTX 패킷 조립 (RFC 4588)**
+- PT = 97 (rtx), SSRC = RTX 전용 SSRC (별도 할당)
+- 페이로드: [원본 seq 2바이트] + [원본 RTP 페이로드]
+- RTX 전용 seq 카운터 별도 관리
+
+**C-4. RTX SSRC 관리**
+- participant별 video track에 RTX SSRC 추가 할당
+- tracks_update에 rtx_ssrc 필드 추가
+
+### 클라이언트 측
+
+**C-5. subscribe SDP RTX SSRC 선언**
+- `a=ssrc-group:FID {video_ssrc} {rtx_ssrc}`
+- `a=ssrc:{rtx_ssrc} cname:light-sfu`
+
+### 파일 변경 예상
+- `src/transport/udp.rs` — RtpCache 추가, NACK 파싱, RTX 조립/전송
+- `src/room/participant.rs` — RtpCache 필드, RTX SSRC 필드
+- `common/sdp-builder.mjs` — ssrc-group:FID 추가
+- `src/signaling/handler.rs` — tracks_update에 rtx_ssrc 포함
+
+---
+
+## 13. 주의사항
 
 ### 절대 하지 말 것
 - re-nego 성급하게 구현 (mini 실패 원인)

@@ -281,17 +281,21 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     info!("ROOM_JOIN user={} room={} pub_ufrag={} sub_ufrag={}",
         user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
-    // Collect existing participants' tracks for the new joiner
+    // Collect existing participants' tracks for the new joiner (rtx_ssrc 포함)
     let existing_tracks: Vec<serde_json::Value> = room.other_participants(&user_id)
         .iter()
         .flat_map(|p| {
             p.get_tracks().into_iter().map(|t| {
-                serde_json::json!({
+                let mut j = serde_json::json!({
                     "user_id": p.user_id,
                     "kind": t.kind.to_string(),
                     "ssrc": t.ssrc,
                     "track_id": t.track_id,
-                })
+                });
+                if let Some(rs) = t.rtx_ssrc {
+                    j["rtx_ssrc"] = serde_json::json!(rs);
+                }
+                j
             })
         })
         .collect();
@@ -374,12 +378,22 @@ async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Pac
         let track_id = format!("{}_{}", user_id, track_id_counter);
         track_id_counter += 1;
         participant.add_track(t.ssrc, kind.clone(), track_id.clone());
-        new_tracks.push(serde_json::json!({
+
+        // add_track 후 등록된 트랙에서 rtx_ssrc 가져오기
+        let rtx_ssrc = participant.get_tracks().iter()
+            .find(|tr| tr.ssrc == t.ssrc)
+            .and_then(|tr| tr.rtx_ssrc);
+
+        let mut track_json = serde_json::json!({
             "user_id": user_id,
             "kind": t.kind,
             "ssrc": t.ssrc,
             "track_id": track_id,
-        }));
+        });
+        if let Some(rs) = rtx_ssrc {
+            track_json["rtx_ssrc"] = serde_json::json!(rs);
+        }
+        new_tracks.push(track_json);
     }
 
     info!("PUBLISH_TRACKS user={} count={}", user_id, new_tracks.len());
@@ -423,12 +437,16 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
                 let tracks = p.get_tracks();
                 if !tracks.is_empty() {
                     let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
-                        serde_json::json!({
+                        let mut j = serde_json::json!({
                             "user_id": user_id,
                             "kind": t.kind.to_string(),
                             "ssrc": t.ssrc,
                             "track_id": t.track_id,
-                        })
+                        });
+                        if let Some(rs) = t.rtx_ssrc {
+                            j["rtx_ssrc"] = serde_json::json!(rs);
+                        }
+                        j
                     }).collect();
                     let tracks_event = Packet::new(
                         opcode::TRACKS_UPDATE,
@@ -515,12 +533,16 @@ async fn cleanup(session: &Session, state: &AppState) {
             // tracks_update(remove)
             if !tracks.is_empty() {
                 let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
-                    serde_json::json!({
+                    let mut j = serde_json::json!({
                         "user_id": user_id,
                         "kind": t.kind.to_string(),
                         "ssrc": t.ssrc,
                         "track_id": t.track_id,
-                    })
+                    });
+                    if let Some(rs) = t.rtx_ssrc {
+                        j["rtx_ssrc"] = serde_json::json!(rs);
+                    }
+                    j
                 }).collect();
                 let tracks_event = Packet::new(
                     opcode::TRACKS_UPDATE,
