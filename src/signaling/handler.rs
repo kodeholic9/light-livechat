@@ -1,17 +1,17 @@
 // author: kodeholic (powered by Claude)
-//! WebSocket handler — signaling lifecycle
+//! WebSocket handler — signaling lifecycle (2PC / SDP-free)
 //!
 //! Connection flow:
 //!   1. Server sends HELLO (heartbeat_interval)
 //!   2. Client sends IDENTIFY (token) → Server responds with user_id
-//!   3. Client sends ROOM_JOIN (room_id, sdp_offer)
-//!      → Server parses SDP Offer (codecs, extmap, SSRC)
-//!      → Server creates Participant (ufrag, ice_pwd)
-//!      → Server registers in RoomHub (3 indices)
-//!      → Server builds SDP Answer (ICE-Lite, passive DTLS, codec mirror)
-//!      → Server responds with sdp_answer + participants
-//!   4. Browser initiates ICE → STUN → DTLS → SRTP (media path)
-//!   5. Client sends ROOM_LEAVE or disconnects → cleanup
+//!   3. Client sends ROOM_JOIN (room_id)
+//!      → Server creates Participant (pub_ufrag, sub_ufrag)
+//!      → Server registers in RoomHub (3 indices × 2 sessions)
+//!      → Server responds with server_config (ICE, DTLS, codecs, extmap)
+//!   4. Client builds fake SDP locally → ICE → STUN → DTLS → SRTP
+//!   5. Client sends PUBLISH_TRACKS (ssrc, kind per track)
+//!   6. Server broadcasts TRACKS_UPDATE to other participants
+//!   7. Client sends ROOM_LEAVE or disconnects → cleanup
 
 use axum::{
     extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
@@ -23,12 +23,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config;
-use crate::room::participant::Participant;
+use crate::room::participant::{Participant, TrackKind};
 use crate::signaling::message::*;
 use crate::signaling::opcode;
 use crate::state::AppState;
 use crate::transport::ice::IceCredentials;
-use crate::transport::sdp;
 
 // ============================================================================
 // Session (per-WS connection)
@@ -37,10 +36,12 @@ use crate::transport::sdp;
 struct Session {
     user_id:      Option<String>,
     current_room: Option<String>,
-    ufrag:        Option<String>,   // RoomHub cleanup key
+    /// publish ufrag (cleanup key)
+    pub_ufrag:    Option<String>,
+    /// subscribe ufrag (cleanup key)
+    sub_ufrag:    Option<String>,
     server_pid:   AtomicU64,
     ack_miss:     AtomicU64,
-    /// Send signaling messages back to this WS
     ws_tx:        mpsc::UnboundedSender<String>,
 }
 
@@ -49,7 +50,8 @@ impl Session {
         Self {
             user_id:      None,
             current_room: None,
-            ufrag:        None,
+            pub_ufrag:    None,
+            sub_ufrag:    None,
             server_pid:   AtomicU64::new(1),
             ack_miss:     AtomicU64::new(0),
             ws_tx,
@@ -92,18 +94,13 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         return;
     }
 
-    // Single loop with select: no split needed at our scale (20 participants).
-    // Server-initiated events go through ws_tx → checked in the loop.
-
     loop {
         tokio::select! {
-            // Outbound: server events queued via ws_tx
             Some(json) = ws_rx.recv() => {
                 if socket.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
             }
-            // Inbound: client messages
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -127,7 +124,6 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup on disconnect
     cleanup(&session, &state).await;
     info!("connection closed: {:?}", session.user_id);
 }
@@ -142,14 +138,12 @@ async fn send_packet(socket: &mut WebSocket, packet: &Packet) -> Result<(), ()> 
 // ============================================================================
 
 async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Option<Packet> {
-    // ACK from client (response to our event)
     if packet.is_response() {
         debug!("ACK received pid={}", packet.pid);
         session.ack_miss.store(0, Ordering::Relaxed);
         return None;
     }
 
-    // Auth gate: only HEARTBEAT and IDENTIFY allowed before auth
     if packet.op != opcode::HEARTBEAT && packet.op != opcode::IDENTIFY {
         if !session.is_authenticated() {
             return Some(Packet::err(packet.op, packet.pid, 1001, "not authenticated"));
@@ -157,18 +151,14 @@ async fn dispatch(session: &mut Session, state: &AppState, packet: Packet) -> Op
     }
 
     match packet.op {
-        opcode::HEARTBEAT    => Some(Packet::ok(opcode::HEARTBEAT, packet.pid, serde_json::json!({}))),
-        opcode::IDENTIFY     => Some(handle_identify(session, state, &packet)),
-        opcode::ROOM_LIST    => Some(handle_room_list(state, &packet)),
-        opcode::ROOM_CREATE  => Some(handle_room_create(state, &packet)),
-        opcode::ROOM_JOIN    => Some(handle_room_join(session, state, &packet).await),
-        opcode::ROOM_LEAVE   => Some(handle_room_leave(session, state, &packet).await),
-        opcode::SDP_OFFER    => Some(handle_sdp_offer(session, state, &packet)),
-        opcode::ICE_CANDIDATE => {
-            debug!("ICE_CANDIDATE (trickle ICE — ignored in ICE-Lite)");
-            Some(Packet::ok(opcode::ICE_CANDIDATE, packet.pid, serde_json::json!({})))
-        }
-        opcode::MESSAGE      => Some(handle_message(session, state, &packet).await),
+        opcode::HEARTBEAT       => Some(Packet::ok(opcode::HEARTBEAT, packet.pid, serde_json::json!({}))),
+        opcode::IDENTIFY        => Some(handle_identify(session, state, &packet)),
+        opcode::ROOM_LIST       => Some(handle_room_list(state, &packet)),
+        opcode::ROOM_CREATE     => Some(handle_room_create(state, &packet)),
+        opcode::ROOM_JOIN       => Some(handle_room_join(session, state, &packet).await),
+        opcode::ROOM_LEAVE      => Some(handle_room_leave(session, state, &packet).await),
+        opcode::PUBLISH_TRACKS  => Some(handle_publish_tracks(session, state, &packet).await),
+        opcode::MESSAGE         => Some(handle_message(session, state, &packet).await),
         _ => {
             warn!("unknown opcode: {}", packet.op);
             Some(Packet::err(packet.op, packet.pid, 3001, "invalid opcode"))
@@ -186,8 +176,6 @@ fn handle_identify(session: &mut Session, _state: &AppState, packet: &Packet) ->
         Err(_) => return Packet::err(opcode::IDENTIFY, packet.pid, 3002, "invalid payload"),
     };
 
-    // TODO: token verification (for now accept anything)
-    // 클라이언트가 user_id 지정 → 수용, 없으면 랜덤 생성
     let user_id = req.user_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| format!("U{:03}", rand_u16() % 1000));
@@ -235,11 +223,7 @@ fn handle_room_create(state: &AppState, packet: &Packet) -> Packet {
         Err(_) => return Packet::err(opcode::ROOM_CREATE, packet.pid, 3002, "invalid payload"),
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
+    let now = current_ts();
     let room = state.rooms.create(req.name.clone(), req.capacity, now);
     info!("ROOM_CREATE id={} name={}", room.id, room.name);
 
@@ -251,7 +235,7 @@ fn handle_room_create(state: &AppState, packet: &Packet) -> Packet {
 }
 
 // ============================================================================
-// ROOM_JOIN — the core signaling path
+// ROOM_JOIN — server_config 응답 (SDP-free)
 // ============================================================================
 
 async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Packet) -> Packet {
@@ -262,78 +246,60 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
 
     let user_id = session.user_id.clone().unwrap();
 
-    // Parse SDP Offer
-    let parsed_offer = match sdp::parse_offer(&req.sdp_offer) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("SDP parse failed user={}: {}", user_id, e);
-            return Packet::err(opcode::ROOM_JOIN, packet.pid, 4001, "sdp parse error");
-        }
-    };
-
-    // [DBG:SDP] Offer 파싱 결과
-    for sec in &parsed_offer.sections {
-        let pts: Vec<&str> = sec.codec_lines.iter()
-            .filter(|l| l.starts_with("a=rtpmap:"))
-            .map(|l| l.as_str())
-            .collect();
-        info!("[DBG:SDP] offer section mid={} type={} dir={} ssrcs={:?} codecs={:?}",
-            sec.mid, sec.media_type, sec.direction, sec.ssrcs, pts);
-    }
-    info!("[DBG:SDP] bundle_mids={:?}", parsed_offer.bundle_mids);
-
     // Get room
     let room = match state.rooms.get(&req.room_id) {
         Ok(r) => r,
         Err(_) => return Packet::err(opcode::ROOM_JOIN, packet.pid, 2001, "room not found"),
     };
 
-    // Generate ICE credentials for this participant
-    let ice = IceCredentials::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // Generate ICE credentials (2 sets: publish + subscribe)
+    let pub_ice = IceCredentials::new();
+    let sub_ice = IceCredentials::new();
+    let now = current_ts();
 
-    // Create Participant
+    // Create Participant with 2PC sessions
     let participant = Arc::new(Participant::new(
         user_id.clone(),
         req.room_id.clone(),
-        ice.ufrag.clone(),
-        ice.pwd.clone(),
+        pub_ice.ufrag.clone(),
+        pub_ice.pwd.clone(),
+        sub_ice.ufrag.clone(),
+        sub_ice.pwd.clone(),
         session.ws_tx.clone(),
         now,
     ));
 
-    // Register in RoomHub (participants + ufrag_index)
+    // Register in RoomHub (participants + 2 ufrag indices)
     if let Err(e) = state.rooms.add_participant(&req.room_id, Arc::clone(&participant)) {
         return Packet::err(opcode::ROOM_JOIN, packet.pid, e.code(), &e.to_string());
     }
 
     session.current_room = Some(req.room_id.clone());
-    session.ufrag = Some(ice.ufrag.clone());
+    session.pub_ufrag = Some(pub_ice.ufrag.clone());
+    session.sub_ufrag = Some(sub_ice.ufrag.clone());
 
-    // Build SDP Answer
-    let sdp_answer = sdp::build_answer(
-        &parsed_offer,
-        &state.cert.fingerprint,
-        &ice.ufrag,
-        &ice.pwd,
-        config::UDP_PORT,
-    );
+    info!("ROOM_JOIN user={} room={} pub_ufrag={} sub_ufrag={}",
+        user_id, req.room_id, pub_ice.ufrag, sub_ice.ufrag);
 
-    // [DBG:SDP] Answer 전문 (줄 단위)
-    for line in sdp_answer.lines() {
-        debug!("[DBG:SDP] answer | {}", line);
-    }
-
-    info!("ROOM_JOIN user={} room={} ufrag={} sections={}",
-        user_id, req.room_id, ice.ufrag, parsed_offer.sections.len());
+    // Collect existing participants' tracks for the new joiner
+    let existing_tracks: Vec<serde_json::Value> = room.other_participants(&user_id)
+        .iter()
+        .flat_map(|p| {
+            p.get_tracks().into_iter().map(|t| {
+                serde_json::json!({
+                    "user_id": p.user_id,
+                    "kind": t.kind.to_string(),
+                    "ssrc": t.ssrc,
+                    "track_id": t.track_id,
+                })
+            })
+        })
+        .collect();
 
     // Notify existing participants
     let event = Packet::new(
         opcode::ROOM_EVENT,
-        0, // event pid will be set by receiver
+        0,
         serde_json::to_value(RoomEventPayload {
             event_type: "participant_joined".to_string(),
             room_id: req.room_id.clone(),
@@ -342,13 +308,97 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     );
     broadcast_to_others(&room, &user_id, &event);
 
-    // Current member list
+    // Detect local IP for ICE candidate
+    let local_ip = detect_local_ip();
     let members: Vec<String> = room.member_ids();
 
+    // Build server_config response (SDP-free!)
     Packet::ok(opcode::ROOM_JOIN, packet.pid, serde_json::json!({
         "room_id": req.room_id,
-        "sdp_answer": sdp_answer,
         "participants": members,
+        "server_config": {
+            "ice": {
+                "publish_ufrag": pub_ice.ufrag,
+                "publish_pwd": pub_ice.pwd,
+                "subscribe_ufrag": sub_ice.ufrag,
+                "subscribe_pwd": sub_ice.pwd,
+                "ip": local_ip,
+                "port": config::UDP_PORT,
+            },
+            "dtls": {
+                "fingerprint": format!("sha-256 {}", state.cert.fingerprint),
+                "setup": "passive",
+            },
+            "codecs": server_codec_policy(),
+            "extmap": server_extmap_policy(),
+        },
+        "tracks": existing_tracks,
+    }))
+}
+
+// ============================================================================
+// PUBLISH_TRACKS — 클라이언트가 자기 트랙 SSRC 등록
+// ============================================================================
+
+async fn handle_publish_tracks(session: &Session, state: &AppState, packet: &Packet) -> Packet {
+    let req: PublishTracksRequest = match serde_json::from_value(packet.d.clone()) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::PUBLISH_TRACKS, packet.pid, 3002, "invalid payload"),
+    };
+
+    let user_id = session.user_id.as_ref().unwrap();
+    let room_id = match &session.current_room {
+        Some(r) => r,
+        None => return Packet::err(opcode::PUBLISH_TRACKS, packet.pid, 2004, "not in room"),
+    };
+
+    let room = match state.rooms.get(room_id) {
+        Ok(r) => r,
+        Err(_) => return Packet::err(opcode::PUBLISH_TRACKS, packet.pid, 2001, "room not found"),
+    };
+
+    let participant = match room.get_participant(user_id) {
+        Some(p) => p,
+        None => return Packet::err(opcode::PUBLISH_TRACKS, packet.pid, 2004, "not in room"),
+    };
+
+    // Register tracks on participant
+    let mut track_id_counter = participant.get_tracks().len();
+    let mut new_tracks = Vec::new();
+    for t in &req.tracks {
+        let kind = match t.kind.as_str() {
+            "audio" => TrackKind::Audio,
+            "video" => TrackKind::Video,
+            _ => continue,
+        };
+        let track_id = format!("{}_{}", user_id, track_id_counter);
+        track_id_counter += 1;
+        participant.add_track(t.ssrc, kind.clone(), track_id.clone());
+        new_tracks.push(serde_json::json!({
+            "user_id": user_id,
+            "kind": t.kind,
+            "ssrc": t.ssrc,
+            "track_id": track_id,
+        }));
+    }
+
+    info!("PUBLISH_TRACKS user={} count={}", user_id, new_tracks.len());
+
+    // Broadcast tracks_update to other participants
+    if !new_tracks.is_empty() {
+        let tracks_event = Packet::new(
+            opcode::TRACKS_UPDATE,
+            0,
+            serde_json::json!({
+                "action": "add",
+                "tracks": new_tracks,
+            }),
+        );
+        broadcast_to_others(&room, user_id, &tracks_event);
+    }
+
+    Packet::ok(opcode::PUBLISH_TRACKS, packet.pid, serde_json::json!({
+        "registered": new_tracks.len(),
     }))
 }
 
@@ -365,11 +415,32 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
     let user_id = session.user_id.as_ref().unwrap();
 
     match state.rooms.remove_participant(&req.room_id, user_id) {
-        Ok(_p) => {
+        Ok(p) => {
             info!("ROOM_LEAVE user={} room={}", user_id, req.room_id);
 
-            // Notify remaining participants
+            // Notify remaining: participant_left + tracks_update(remove)
             if let Ok(room) = state.rooms.get(&req.room_id) {
+                let tracks = p.get_tracks();
+                if !tracks.is_empty() {
+                    let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
+                        serde_json::json!({
+                            "user_id": user_id,
+                            "kind": t.kind.to_string(),
+                            "ssrc": t.ssrc,
+                            "track_id": t.track_id,
+                        })
+                    }).collect();
+                    let tracks_event = Packet::new(
+                        opcode::TRACKS_UPDATE,
+                        0,
+                        serde_json::json!({
+                            "action": "remove",
+                            "tracks": remove_tracks,
+                        }),
+                    );
+                    broadcast_to_room(&room, &tracks_event);
+                }
+
                 let event = Packet::new(
                     opcode::ROOM_EVENT,
                     0,
@@ -383,24 +454,13 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
             }
 
             session.current_room = None;
-            session.ufrag = None;
+            session.pub_ufrag = None;
+            session.sub_ufrag = None;
 
             Packet::ok(opcode::ROOM_LEAVE, packet.pid, serde_json::json!({}))
         }
         Err(e) => Packet::err(opcode::ROOM_LEAVE, packet.pid, e.code(), &e.to_string()),
     }
-}
-
-// ============================================================================
-// SDP_OFFER (renegotiation)
-// ============================================================================
-
-fn handle_sdp_offer(_session: &Session, _state: &AppState, packet: &Packet) -> Packet {
-    // TODO: Phase 4 — renegotiation for adding/removing tracks
-    debug!("SDP_OFFER received (renegotiation — not yet implemented)");
-    Packet::ok(opcode::SDP_OFFER, packet.pid, serde_json::json!({
-        "sdp_answer": "TODO"
-    }))
 }
 
 // ============================================================================
@@ -439,8 +499,40 @@ async fn handle_message(session: &Session, state: &AppState, packet: &Packet) ->
 
 async fn cleanup(session: &Session, state: &AppState) {
     if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
+        // Get tracks before removing (for tracks_update broadcast)
+        let tracks = if let Ok(room) = state.rooms.get(room_id) {
+            if let Some(p) = room.get_participant(user_id) {
+                p.get_tracks()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
         // Notify others before removing
         if let Ok(room) = state.rooms.get(room_id) {
+            // tracks_update(remove)
+            if !tracks.is_empty() {
+                let remove_tracks: Vec<serde_json::Value> = tracks.iter().map(|t| {
+                    serde_json::json!({
+                        "user_id": user_id,
+                        "kind": t.kind.to_string(),
+                        "ssrc": t.ssrc,
+                        "track_id": t.track_id,
+                    })
+                }).collect();
+                let tracks_event = Packet::new(
+                    opcode::TRACKS_UPDATE,
+                    0,
+                    serde_json::json!({
+                        "action": "remove",
+                        "tracks": remove_tracks,
+                    }),
+                );
+                broadcast_to_others(&room, user_id, &tracks_event);
+            }
+
             let event = Packet::new(
                 opcode::ROOM_EVENT,
                 0,
@@ -458,6 +550,41 @@ async fn cleanup(session: &Session, state: &AppState) {
         }
         debug!("cleanup done user={} room={}", user_id, room_id);
     }
+}
+
+// ============================================================================
+// Server codec/extmap policy (fixed, no negotiation)
+// ============================================================================
+
+fn server_codec_policy() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "kind": "audio",
+            "name": "opus",
+            "pt": 111,
+            "clockrate": 48000,
+            "channels": 2,
+            "rtcp_fb": ["nack"],
+            "fmtp": "minptime=10;useinbandfec=1"
+        },
+        {
+            "kind": "video",
+            "name": "VP8",
+            "pt": 96,
+            "clockrate": 90000,
+            "rtx_pt": 97,
+            "rtcp_fb": ["nack", "nack pli", "ccm fir", "goog-remb"]
+        }
+    ])
+}
+
+fn server_extmap_policy() -> serde_json::Value {
+    serde_json::json!([
+        { "id": 1, "uri": "urn:ietf:params:rtp-hdrext:sdes:mid" },
+        { "id": 4, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level" },
+        { "id": 5, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" },
+        { "id": 6, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" }
+    ])
 }
 
 // ============================================================================
@@ -486,9 +613,30 @@ fn broadcast_to_room(room: &crate::room::room::Room, packet: &Packet) {
     }
 }
 
-/// 랜덤 u16 생성 (getrandom 기반)
+// ============================================================================
+// Utility
+// ============================================================================
+
 fn rand_u16() -> u16 {
     let mut buf = [0u8; 2];
     getrandom::fill(&mut buf).expect("getrandom failed");
     u16::from_le_bytes(buf)
+}
+
+fn current_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 라우팅 테이블 기반 로컬 IP 감지
+fn detect_local_ip() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }

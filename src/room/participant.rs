@@ -1,12 +1,14 @@
 // author: kodeholic (powered by Claude)
-//! Participant — per-user state including signaling + media transport
+//! Participant — per-user state with 2PC (publish + subscribe) sessions
 //!
-//! Each participant owns:
-//!   - WS channel (signaling)
-//!   - ICE credentials (ufrag/pwd for STUN verification)
-//!   - DTLS session (via DemuxConn)
-//!   - SRTP inbound/outbound contexts
-//!   - Published tracks (SSRC-based)
+//! 2PC 구조:
+//!   - publish_session:  클라이언트 → 서버 (recvonly on server side)
+//!     ICE/DTLS/SRTP 1세트, 내 트랙 송신용, 거의 불변
+//!   - subscribe_session: 서버 → 클라이언트 (sendonly on server side)
+//!     ICE/DTLS/SRTP 1세트, 다른 참가자 트랙 수신용, re-nego 대상
+//!
+//! 서버는 ufrag를 PC별로 2개 생성하여 STUN latch 시 PC 종류를 식별한다.
+//! latching 후에는 sockaddr → (user_id, PcType) 매핑으로 O(1) 식별.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +17,29 @@ use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::transport::srtp::SrtpContext;
+
+// ============================================================================
+// PcType — PeerConnection 종류 식별
+// ============================================================================
+
+/// 2PC 구조에서 PeerConnection 종류를 식별하는 enum.
+/// STUN latch 시 서버 ufrag로 판별하며, sockaddr_map에 저장된다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcType {
+    /// 클라이언트 → 서버 (서버가 recvonly, 미디어 수신)
+    Publish,
+    /// 서버 → 클라이언트 (서버가 sendonly, 미디어 전송)
+    Subscribe,
+}
+
+impl std::fmt::Display for PcType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PcType::Publish => write!(f, "pub"),
+            PcType::Subscribe => write!(f, "sub"),
+        }
+    }
+}
 
 // ============================================================================
 // Track
@@ -26,14 +51,82 @@ pub enum TrackKind {
     Video,
 }
 
+impl std::fmt::Display for TrackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackKind::Audio => write!(f, "audio"),
+            TrackKind::Video => write!(f, "video"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Track {
     pub ssrc: u32,
     pub kind: TrackKind,
+    pub track_id: String,
 }
 
 // ============================================================================
-// Participant
+// MediaSession — ICE/DTLS/SRTP 세션 (PC당 1개)
+// ============================================================================
+
+/// 하나의 PeerConnection에 대응하는 미디어 전송 세션.
+/// publish/subscribe 각각 독립된 ICE/DTLS/SRTP 상태를 가진다.
+pub struct MediaSession {
+    // --- ICE ---
+    pub ufrag:   String,
+    pub ice_pwd: String,
+
+    // --- transport ---
+    /// Latched UDP address (STUN Binding Request 성공 시 설정)
+    pub address: Mutex<Option<SocketAddr>>,
+
+    // --- SRTP ---
+    pub inbound_srtp:  Mutex<SrtpContext>,
+    pub outbound_srtp: Mutex<SrtpContext>,
+}
+
+impl MediaSession {
+    pub fn new(ufrag: String, ice_pwd: String) -> Self {
+        Self {
+            ufrag,
+            ice_pwd,
+            address:       Mutex::new(None),
+            inbound_srtp:  Mutex::new(SrtpContext::new()),
+            outbound_srtp: Mutex::new(SrtpContext::new()),
+        }
+    }
+
+    /// STUN latch: 확인된 UDP 주소 설정
+    pub fn latch_address(&self, addr: SocketAddr) {
+        *self.address.lock().unwrap() = Some(addr);
+    }
+
+    pub fn get_address(&self) -> Option<SocketAddr> {
+        *self.address.lock().unwrap()
+    }
+
+    /// SRTP 키 설치 여부 (DTLS 핸드셰이크 완료 = 미디어 준비)
+    pub fn is_media_ready(&self) -> bool {
+        self.inbound_srtp.lock().unwrap().is_ready()
+    }
+
+    /// DTLS 핸드셰이크 완료 후 SRTP 키 설치
+    pub fn install_srtp_keys(
+        &self,
+        client_key:  &[u8],
+        client_salt: &[u8],
+        server_key:  &[u8],
+        server_salt: &[u8],
+    ) {
+        self.inbound_srtp.lock().unwrap().install_key(client_key, client_salt);
+        self.outbound_srtp.lock().unwrap().install_key(server_key, server_salt);
+    }
+}
+
+// ============================================================================
+// Participant — 2PC 세션 소유
 // ============================================================================
 
 pub struct Participant {
@@ -44,48 +137,44 @@ pub struct Participant {
     pub last_seen:  AtomicU64,
 
     // --- signaling ---
-    /// Send JSON messages to this participant's WebSocket
+    /// WebSocket으로 JSON 메시지 전송
     pub ws_tx: mpsc::UnboundedSender<String>,
 
-    // --- ICE ---
-    pub ufrag:   String,   // server-generated, immutable lookup key
-    pub ice_pwd: String,   // STUN MESSAGE-INTEGRITY verification
-
-    // --- transport ---
-    /// Latched UDP address (set after first valid STUN Binding Request)
-    pub address: Mutex<Option<SocketAddr>>,
-
-    // --- SRTP (per-participant, shared across all BUNDLE tracks) ---
-    pub inbound_srtp:  Mutex<SrtpContext>,  // browser → server (decrypt)
-    pub outbound_srtp: Mutex<SrtpContext>,  // server → browser (encrypt)
+    // --- 2PC sessions ---
+    /// 클라이언트 → 서버 (내 미디어 송신)
+    pub publish:   MediaSession,
+    /// 서버 → 클라이언트 (다른 참가자 미디어 수신)
+    pub subscribe: MediaSession,
 
     // --- tracks ---
-    /// Published tracks (populated from SDP offer)
+    /// 이 참가자가 publish하는 트랙 목록 (publish_tracks 메시지로 등록)
     pub tracks: Mutex<Vec<Track>>,
 }
 
 impl Participant {
     pub fn new(
-        user_id:   String,
-        room_id:   String,
-        ufrag:     String,
-        ice_pwd:   String,
-        ws_tx:     mpsc::UnboundedSender<String>,
-        joined_at: u64,
+        user_id:    String,
+        room_id:    String,
+        pub_ufrag:  String,
+        pub_pwd:    String,
+        sub_ufrag:  String,
+        sub_pwd:    String,
+        ws_tx:      mpsc::UnboundedSender<String>,
+        joined_at:  u64,
     ) -> Self {
-        trace!("Participant::new user={} room={} ufrag={}", user_id, room_id, ufrag);
+        trace!(
+            "Participant::new user={} room={} pub_ufrag={} sub_ufrag={}",
+            user_id, room_id, pub_ufrag, sub_ufrag
+        );
         Self {
             user_id,
             room_id,
             joined_at,
-            last_seen:     AtomicU64::new(joined_at),
+            last_seen:  AtomicU64::new(joined_at),
             ws_tx,
-            ufrag,
-            ice_pwd,
-            address:       Mutex::new(None),
-            inbound_srtp:  Mutex::new(SrtpContext::new()),
-            outbound_srtp: Mutex::new(SrtpContext::new()),
-            tracks:        Mutex::new(Vec::new()),
+            publish:    MediaSession::new(pub_ufrag, pub_pwd),
+            subscribe:  MediaSession::new(sub_ufrag, sub_pwd),
+            tracks:     Mutex::new(Vec::new()),
         }
     }
 
@@ -93,39 +182,47 @@ impl Participant {
         self.last_seen.store(ts, Ordering::Relaxed);
     }
 
-    /// STUN latch: set confirmed UDP address
-    pub fn latch_address(&self, addr: SocketAddr) {
-        *self.address.lock().unwrap() = Some(addr);
+    /// PcType에 해당하는 MediaSession 참조
+    pub fn session(&self, pc: PcType) -> &MediaSession {
+        match pc {
+            PcType::Publish   => &self.publish,
+            PcType::Subscribe => &self.subscribe,
+        }
     }
 
-    pub fn get_address(&self) -> Option<SocketAddr> {
-        *self.address.lock().unwrap()
-    }
-
-    /// Register a track (deduplicated by SSRC)
-    pub fn add_track(&self, ssrc: u32, kind: TrackKind) {
+    /// 트랙 등록 (SSRC 중복 방지)
+    pub fn add_track(&self, ssrc: u32, kind: TrackKind, track_id: String) {
         let mut tracks = self.tracks.lock().unwrap();
         if !tracks.iter().any(|t| t.ssrc == ssrc) {
-            tracks.push(Track { ssrc, kind });
+            tracks.push(Track { ssrc, kind, track_id });
             trace!("track added ssrc={} user={}", ssrc, self.user_id);
         }
     }
 
-    /// Check if SRTP keys are installed (DTLS handshake completed)
-    pub fn is_media_ready(&self) -> bool {
-        self.inbound_srtp.lock().unwrap().is_ready()
+    /// 트랙 제거 (SSRC 기준)
+    pub fn remove_track(&self, ssrc: u32) -> Option<Track> {
+        let mut tracks = self.tracks.lock().unwrap();
+        if let Some(pos) = tracks.iter().position(|t| t.ssrc == ssrc) {
+            Some(tracks.remove(pos))
+        } else {
+            None
+        }
     }
 
-    /// Install SRTP keys after DTLS handshake
-    pub fn install_srtp_keys(
-        &self,
-        client_key:  &[u8],
-        client_salt: &[u8],
-        server_key:  &[u8],
-        server_salt: &[u8],
-    ) {
-        self.inbound_srtp.lock().unwrap().install_key(client_key, client_salt);
-        self.outbound_srtp.lock().unwrap().install_key(server_key, server_salt);
-        trace!("SRTP keys installed user={}", self.user_id);
+    /// 현재 publish 트랙 목록 스냅샷
+    pub fn get_tracks(&self) -> Vec<Track> {
+        self.tracks.lock().unwrap().clone()
+    }
+
+    // --- 편의 메서드: publish session 기준 ---
+
+    /// publish PC가 미디어 준비 완료인지
+    pub fn is_publish_ready(&self) -> bool {
+        self.publish.is_media_ready()
+    }
+
+    /// subscribe PC가 미디어 준비 완료인지
+    pub fn is_subscribe_ready(&self) -> bool {
+        self.subscribe.is_media_ready()
     }
 }

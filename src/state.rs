@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use crate::media::router::Router;
 use crate::room::room::RoomHub;
 use crate::transport::dtls::ServerCert;
 
@@ -11,7 +10,6 @@ use crate::transport::dtls::ServerCert;
 #[derive(Clone)]
 pub struct AppState {
     pub rooms:  Arc<RoomHub>,
-    pub router: Arc<Router>,
     pub cert:   Arc<ServerCert>,
 }
 
@@ -19,7 +17,6 @@ impl AppState {
     pub fn new(cert: ServerCert) -> Self {
         Self {
             rooms:  Arc::new(RoomHub::new()),
-            router: Arc::new(Router::new()),
             cert:   Arc::new(cert),
         }
     }

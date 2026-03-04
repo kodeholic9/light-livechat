@@ -1,8 +1,8 @@
 [package]
 name = "light-livechat"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-description = "High-performance SFU server with Bundle + ICE-Lite"
+description = "High-performance SFU server — 2PC / SDP-free architecture"
 authors = ["kodeholic (powered by Claude)"]
 
 [dependencies]

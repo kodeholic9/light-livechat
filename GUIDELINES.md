@@ -185,10 +185,13 @@ async-trait = "0.1"
 | 2 | UDP ↔ RoomHub 통합 (전체 파이프라인) | 0.1.3 | ✅ |
 | 3 | SDP Negotiation (브라우저 연동) | 0.1.4 | ✅ |
 | 3.5 | 디버그 로그 + 영상 렌더링 수정 | 0.1.4 | ✅ |
-| 4 | RTP 라우팅 정제 (RTCP 릴레이, PLI, SSRC→user 매핑) | 0.1.5 | |
-| 5 | Hardening (인증, 좀비, 타임아웃) | 0.1.6 | |
-| 6 | PTT 지원 | 0.1.7 | |
-| 7 | Simulcast / SVC (optional) | 0.2.x | |
+| A-1 | **2PC / SDP-free 아키텍처 전환** | 0.1.5 | ✅ |
+| A-2 | 클라이언트 SdpBuilder (fake SDP 조립) | 0.1.6 | |
+| B | 통합 테스트 (1:1 → 3명 conference) | 0.1.7 | |
+| C | RTCP 릴레이 + PLI + mute/unmute | 0.1.8 | |
+| D | Hardening (인증, 좀비, 타임아웃) | 0.1.9 | |
+| E | PTT 지원 | 0.2.0 | |
+| — | Simulcast / SVC (optional) | 0.3.x | |
 
 ---
 

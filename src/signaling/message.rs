@@ -1,16 +1,10 @@
 // author: kodeholic (powered by Claude)
-//! Signaling message types
+//! Signaling message types (2PC / SDP-free)
 //!
 //! Packet format:
 //!   { "op": N, "pid": u64, "d": { ... } }              — request / event
 //!   { "op": N, "pid": u64, "ok": true,  "d": { ... } } — success response
 //!   { "op": N, "pid": u64, "ok": false, "d": { "code": u16, "msg": "..." } } — error response
-//!
-//! Rules:
-//!   - `pid` is ALWAYS present (sequential, per-side counter starting from 1)
-//!   - `ok` is present ONLY in responses
-//!   - No `ok` field → new request or event (initiator)
-//!   - `ok` field present → response to a previously received pid
 
 use serde::{Deserialize, Serialize};
 
@@ -26,17 +20,14 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Create a new request/event packet (no `ok` field)
     pub fn new(op: u16, pid: u64, d: serde_json::Value) -> Self {
         Self { op, pid, ok: None, d }
     }
 
-    /// Create a success response
     pub fn ok(op: u16, pid: u64, d: serde_json::Value) -> Self {
         Self { op, pid, ok: Some(true), d }
     }
 
-    /// Create an error response
     pub fn err(op: u16, pid: u64, code: u16, msg: &str) -> Self {
         Self {
             op,
@@ -46,7 +37,6 @@ impl Packet {
         }
     }
 
-    /// Is this a response (has `ok` field)?
     pub fn is_response(&self) -> bool {
         self.ok.is_some()
     }
@@ -71,7 +61,7 @@ pub struct RoomCreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct RoomJoinRequest {
     pub room_id: String,
-    pub sdp_offer: String,
+    // SDP-free: sdp_offer 제거됨. 서버가 server_config으로 응답.
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,18 +69,16 @@ pub struct RoomLeaveRequest {
     pub room_id: String,
 }
 
+/// 클라이언트가 자기 트랙 SSRC 등록
 #[derive(Debug, Deserialize)]
-pub struct SdpOfferRequest {
-    pub sdp: String,
+pub struct PublishTracksRequest {
+    pub tracks: Vec<PublishTrackItem>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct IceCandidatePayload {
-    pub candidate: String,
-    #[serde(default)]
-    pub sdp_mid: Option<String>,
-    #[serde(default)]
-    pub sdp_mline_index: Option<u16>,
+pub struct PublishTrackItem {
+    pub kind: String,  // "audio" | "video"
+    pub ssrc: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,24 +97,16 @@ pub struct HelloEvent {
 #[derive(Debug, Serialize)]
 pub struct RoomEventPayload {
     #[serde(rename = "type")]
-    pub event_type: String, // "participant_joined", "participant_left", "room_deleted"
+    pub event_type: String,
     pub room_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TrackEventPayload {
-    #[serde(rename = "type")]
-    pub event_type: String, // "track_added", "track_removed"
-    pub participant_id: String,
-    #[serde(default)]
-    pub tracks: Vec<TrackInfo>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
+    pub user_id: String,
     pub track_id: String,
-    pub kind: String, // "audio", "video"
+    pub kind: String,
     pub ssrc: u32,
 }

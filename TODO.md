@@ -43,54 +43,63 @@
 - [x] Stale DTLS session cleanup
 - [x] AppState shared between WS handlers and UDP transport
 
-## Phase 3: SDP Negotiation ✔
-- [x] SDP Offer parsing (extract codecs, SSRC, mid, direction, extmap, rtcp-rsize)
-- [x] SDP Answer generation (ICE-Lite params, passive DTLS fingerprint, codec mirror, host candidate)
-- [x] ROOM_JOIN flow: sdp_offer required → parse → answer → response
-- [x] ROOM_LIST opcode + 서버 기본 방 생성
-- [x] 클라이언트 SDK + UI (insight-lens) light 프로토콜 전환
-- [x] 브라우저 통합 테스트 (WS→SDP→ICE→DTLS→SRTP relay 확인, 3명 그리드)
-- [ ] Track registration (SSRC → TrackKind mapping) — deferred to Phase 4
+## Phase 3: SDP Negotiation ✅ (v0.1.4)
+- [x] SDP Offer parsing + Answer generation
+- [x] Browser integration test (3-person grid)
+- [x] Debug logging + video rendering fix
 
-## Phase 3.5: Debug Logging + Video Rendering Fix ✅
-- [x] Server debug tags: `[DBG:SDP]`, `[DBG:STUN]`, `[DBG:DTLS]`, `[DBG:RTP]`, `[DBG:RELAY]`, `[DBG:RTCP]`
-- [x] Client debug tags: `[DBG:SDP]`, `[DBG:ICE]`, `[DBG:TRACK]`, `[DBG:RTP]`
-- [x] RTP header parser (logging only): SSRC, PT, seq, timestamp, marker, payload_len
-- [x] Log throttling: AtomicU64 counter, first 50 detailed, 1000-interval summary
-- [x] Client inbound-rtp stats monitor (3s getStats polling)
-- [x] Video rendering fix: remoteVideoStream deferred attach (ontrack ↔ tile timing)
+## Phase A-1: 2PC / SDP-free Architecture ✅ (v0.1.5)
+- [x] PcType enum (Publish / Subscribe)
+- [x] MediaSession 구조체 (ufrag, ice_pwd, address, srtp per session)
+- [x] Participant: publish + subscribe MediaSession 소유
+- [x] Room: by_ufrag/by_addr → (Participant, PcType) 매핑
+- [x] RoomHub: 참가자당 2개 ufrag 역인덱스
+- [x] Signaling: server_config JSON 응답 (SDP 제거)
+- [x] PUBLISH_TRACKS 핸들러 (클라이언트 트랙 SSRC 등록)
+- [x] TRACKS_UPDATE 이벤트 (subscribe re-nego 트리거)
+- [x] UDP: PcType 식별, publish 수신 → subscribe 전송
+- [x] transport/sdp.rs 삭제
+- [x] Router 제거 (sockaddr 기반 직접 릴레이)
 
-## Phase 4: RTP Routing Refinement
-- [ ] **RTCP 릴레이** — 근본 원인: Chrome congestion control이 피드백 없으면 비트레이트 안 올림 (화질 저하)
-- [ ] **PLI 생성/전송** — 새 참가자 입장 시 키프레임 요청 (첫 프레임 지연 해결)
-- [ ] **SSRC → user_id 매핑** — 3명+ 지원 기반
-- [ ] SSRC rewrite (optional, for simulcast/SVC prep)
-- [ ] Hot-path optimization (minimize allocations, Bytes zero-copy)
-- [ ] Bandwidth estimation (basic)
+## Phase A-2: 클라이언트 SdpBuilder
+- [ ] SdpBuilder JS 모듈 개발
+  - [ ] buildPublishRemoteSdp(serverConfig) → recvonly fake SDP
+  - [ ] buildSubscribeRemoteSdp(serverConfig, tracks[]) → sendonly × N fake SDP
+  - [ ] updateSubscribeRemoteSdp(기존 SDP, 추가/제거 트랙)
+- [ ] SdpBuilder 유닛테스트 (서버 없이 순수 입출력 검증)
+- [ ] 클라이언트 PC 관리 (publish PC + subscribe PC 생성/연결)
+- [ ] tracks_update 수신 → subscribe PC re-negotiation
 
-## Phase 5: Hardening
+## Phase B: 통합 테스트
+- [ ] 1:1 audio 통화 확인
+- [ ] 1:1 video 통화 확인
+- [ ] 3명 conference (audio + video)
+- [ ] 참가자 입퇴장 시 subscribe re-negotiation 확인
+
+## Phase C: RTCP + 안정화
+- [ ] RTCP 릴레이 (SR/RR transparent relay)
+- [ ] NACK 처리 (수신 → 송신자에게 전달)
+- [ ] PLI 생성/전달 (새 참가자 입장 시 키프레임 요청)
+- [ ] REMB 처리 (대역폭 추정 전달)
+- [ ] mute/unmute 이벤트 처리 (포워딩 중단/재개)
+
+## Phase D: Hardening
 - [ ] IDENTIFY token verification (JWT or shared secret)
 - [ ] Zombie session reaper (last_seen timeout)
-- [ ] ACK miss counter → connection termination
 - [ ] Heartbeat timeout → disconnect
 - [ ] DTLS handshake timeout cleanup
 - [ ] Graceful shutdown (drain connections)
 - [ ] Structured logging & metrics
 
-## Phase 6: PTT Support
+## Phase E: PTT Support
 - [ ] Room mode field (Conference / PTT)
 - [ ] Floor control state machine (Idle → Taken → Idle)
 - [ ] FLOOR_REQUEST / FLOOR_RELEASE opcodes
 - [ ] Relay gate: only floor holder's media forwarded in PTT mode
 - [ ] Floor indicator broadcast
 
-## Phase 7: Simulcast / SVC (Optional)
-- [ ] Simulcast layer detection (RID / SSRC grouping)
-- [ ] Layer selection per subscriber
-- [ ] Adaptive quality switching
-
 ## Backlog
-- [ ] Renegotiation (track add/remove without re-join)
+- [ ] Simulcast / SVC (layer detection, adaptive quality)
 - [ ] TURN relay support (for restrictive NATs)
 - [ ] Recording (RTP → file)
 - [ ] Data channel support

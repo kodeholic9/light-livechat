@@ -1,15 +1,18 @@
 // author: kodeholic (powered by Claude)
-//! Room + RoomHub — conference room state with O(1) media-path lookups
+//! Room + RoomHub — 2PC 구조 conference room with O(1) media-path lookups
+//!
+//! 2PC 구조에서 같은 유저가 sockaddr 2개를 사용한다.
+//! (브라우저가 PC마다 별도 UDP 소켓을 바인딩하므로 로컬 포트가 다르다)
 //!
 //! Lookup paths:
-//!   [signaling]  room_id + user_id → Participant        O(1)
-//!   [STUN]       ufrag → room_id → Participant          O(1) × 2
-//!   [SRTP]       addr  → room_id → Participant          O(1) × 2
+//!   [signaling]  room_id + user_id → Participant                        O(1)
+//!   [STUN]       ufrag → room_id → (Participant, PcType)               O(1) × 2
+//!   [SRTP]       addr  → room_id → (Participant, PcType)               O(1) × 2
 //!
-//! Room holds 3 indices into the same Arc<Participant>:
-//!   participants : user_id → Arc<Participant>   (primary, signaling)
-//!   by_ufrag     : ufrag   → Arc<Participant>   (STUN cold path)
-//!   by_addr      : addr    → Arc<Participant>   (SRTP hot path)
+//! Room holds 3 indices:
+//!   participants : user_id → Arc<Participant>               (primary, signaling)
+//!   by_ufrag     : ufrag   → (Arc<Participant>, PcType)    (STUN cold path)
+//!   by_addr      : addr    → (Arc<Participant>, PcType)    (SRTP hot path)
 //!
 //! RoomHub holds reverse indices:
 //!   ufrag_index  : ufrag → room_id
@@ -22,7 +25,7 @@ use tracing::{debug, trace};
 
 use crate::config;
 use crate::error::{LightError, LightResult};
-use crate::room::participant::Participant;
+use crate::room::participant::{Participant, PcType};
 
 // ============================================================================
 // Room
@@ -36,10 +39,12 @@ pub struct Room {
 
     /// Primary index: user_id → Participant
     pub participants: DashMap<String, Arc<Participant>>,
-    /// STUN index: ufrag → Participant (populated on join)
-    by_ufrag: DashMap<String, Arc<Participant>>,
-    /// Media index: addr → Participant (populated on STUN latch)
-    by_addr: DashMap<SocketAddr, Arc<Participant>>,
+    /// STUN index: ufrag → (Participant, PcType)
+    /// publish/subscribe 각각의 ufrag가 등록된다
+    by_ufrag: DashMap<String, (Arc<Participant>, PcType)>,
+    /// Media index: addr → (Participant, PcType)
+    /// STUN latch 시 등록, publish/subscribe 각각 별도 addr
+    by_addr: DashMap<SocketAddr, (Arc<Participant>, PcType)>,
 }
 
 impl Room {
@@ -56,7 +61,7 @@ impl Room {
         }
     }
 
-    /// Add participant — registers in both user_id and ufrag indices
+    /// Add participant — registers in user_id + both ufrag indices (pub/sub)
     pub fn add_participant(&self, p: Arc<Participant>) -> LightResult<()> {
         if self.participants.len() >= self.capacity {
             return Err(LightError::RoomFull);
@@ -64,42 +69,65 @@ impl Room {
         if self.participants.contains_key(&p.user_id) {
             return Err(LightError::AlreadyInRoom);
         }
-        self.by_ufrag.insert(p.ufrag.clone(), Arc::clone(&p));
+
+        // ufrag 인덱스: publish + subscribe 각각 등록
+        self.by_ufrag.insert(
+            p.publish.ufrag.clone(),
+            (Arc::clone(&p), PcType::Publish),
+        );
+        self.by_ufrag.insert(
+            p.subscribe.ufrag.clone(),
+            (Arc::clone(&p), PcType::Subscribe),
+        );
+
         self.participants.insert(p.user_id.clone(), p);
         Ok(())
     }
 
-    /// Remove participant — cleans all 3 indices
+    /// Remove participant — cleans all indices (user_id + 2 ufrags + up to 2 addrs)
     pub fn remove_participant(&self, user_id: &str) -> LightResult<Arc<Participant>> {
         let (_, p) = self.participants
             .remove(user_id)
             .ok_or(LightError::NotInRoom)?;
 
-        self.by_ufrag.remove(&p.ufrag);
-        if let Some(addr) = p.get_address() {
+        // ufrag 인덱스 정리
+        self.by_ufrag.remove(&p.publish.ufrag);
+        self.by_ufrag.remove(&p.subscribe.ufrag);
+
+        // addr 인덱스 정리
+        if let Some(addr) = p.publish.get_address() {
             self.by_addr.remove(&addr);
         }
+        if let Some(addr) = p.subscribe.get_address() {
+            self.by_addr.remove(&addr);
+        }
+
         debug!("participant removed user={} room={}", user_id, self.id);
         Ok(p)
     }
 
-    /// STUN latch: register addr index + update participant address
-    /// Returns true if latch succeeded (participant found)
-    pub fn latch(&self, ufrag: &str, addr: SocketAddr) -> Option<Arc<Participant>> {
-        let p = self.by_ufrag.get(ufrag)?.value().clone();
+    /// STUN latch: ufrag로 참가자+PcType 찾아서 해당 세션의 addr 등록
+    /// Returns (Participant, PcType) or None
+    pub fn latch(&self, ufrag: &str, addr: SocketAddr) -> Option<(Arc<Participant>, PcType)> {
+        let (p, pc_type) = {
+            let entry = self.by_ufrag.get(ufrag)?;
+            entry.value().clone()
+        };
+
+        let session = p.session(pc_type);
 
         // 기존 addr이 있으면 제거 (NAT rebinding)
-        if let Some(old_addr) = p.get_address() {
+        if let Some(old_addr) = session.get_address() {
             if old_addr != addr {
                 self.by_addr.remove(&old_addr);
-                trace!("NAT rebind user={} {}→{}", p.user_id, old_addr, addr);
+                trace!("NAT rebind user={} pc={} {}→{}", p.user_id, pc_type, old_addr, addr);
             }
         }
 
-        p.latch_address(addr);
-        self.by_addr.insert(addr, Arc::clone(&p));
-        trace!("latch user={} ufrag={} addr={}", p.user_id, ufrag, addr);
-        Some(p)
+        session.latch_address(addr);
+        self.by_addr.insert(addr, (Arc::clone(&p), pc_type));
+        trace!("latch user={} pc={} ufrag={} addr={}", p.user_id, pc_type, ufrag, addr);
+        Some((p, pc_type))
     }
 
     // --- O(1) lookups ---
@@ -108,11 +136,11 @@ impl Room {
         self.participants.get(user_id).map(|e| e.value().clone())
     }
 
-    pub fn get_by_ufrag(&self, ufrag: &str) -> Option<Arc<Participant>> {
+    pub fn get_by_ufrag(&self, ufrag: &str) -> Option<(Arc<Participant>, PcType)> {
         self.by_ufrag.get(ufrag).map(|e| e.value().clone())
     }
 
-    pub fn get_by_addr(&self, addr: &SocketAddr) -> Option<Arc<Participant>> {
+    pub fn get_by_addr(&self, addr: &SocketAddr) -> Option<(Arc<Participant>, PcType)> {
         self.by_addr.get(addr).map(|e| e.value().clone())
     }
 
@@ -181,11 +209,17 @@ impl RoomHub {
             .remove(room_id)
             .ok_or(LightError::RoomNotFound)?;
 
-        // Clean reverse indices for all participants
+        // Clean reverse indices for all participants (both sessions)
         for entry in room.participants.iter() {
             let p = entry.value();
-            self.ufrag_index.remove(&p.ufrag);
-            if let Some(addr) = p.get_address() {
+            // ufrag 역인덱스 정리 (publish + subscribe)
+            self.ufrag_index.remove(&p.publish.ufrag);
+            self.ufrag_index.remove(&p.subscribe.ufrag);
+            // addr 역인덱스 정리
+            if let Some(addr) = p.publish.get_address() {
+                self.addr_index.remove(&addr);
+            }
+            if let Some(addr) = p.subscribe.get_address() {
                 self.addr_index.remove(&addr);
             }
         }
@@ -197,56 +231,64 @@ impl RoomHub {
         self.rooms.len()
     }
 
-    // --- participant lifecycle (delegates to Room + maintains reverse index) ---
+    // --- participant lifecycle ---
 
-    /// Register participant in room + ufrag reverse index
+    /// Register participant in room + ufrag reverse indices (both pub/sub)
     pub fn add_participant(&self, room_id: &str, p: Arc<Participant>) -> LightResult<()> {
         let room = self.get(room_id)?;
-        let ufrag = p.ufrag.clone();
+        let pub_ufrag = p.publish.ufrag.clone();
+        let sub_ufrag = p.subscribe.ufrag.clone();
         room.add_participant(p)?;
-        self.ufrag_index.insert(ufrag, room_id.to_string());
+        self.ufrag_index.insert(pub_ufrag, room_id.to_string());
+        self.ufrag_index.insert(sub_ufrag, room_id.to_string());
         Ok(())
     }
 
-    /// Remove participant from room + clean reverse indices
+    /// Remove participant from room + clean all reverse indices
     pub fn remove_participant(&self, room_id: &str, user_id: &str) -> LightResult<Arc<Participant>> {
         let room = self.get(room_id)?;
         let p = room.remove_participant(user_id)?;
-        self.ufrag_index.remove(&p.ufrag);
-        if let Some(addr) = p.get_address() {
+        // ufrag 역인덱스 정리
+        self.ufrag_index.remove(&p.publish.ufrag);
+        self.ufrag_index.remove(&p.subscribe.ufrag);
+        // addr 역인덱스 정리
+        if let Some(addr) = p.publish.get_address() {
+            self.addr_index.remove(&addr);
+        }
+        if let Some(addr) = p.subscribe.get_address() {
             self.addr_index.remove(&addr);
         }
         Ok(p)
     }
 
     /// STUN latch: ufrag → find room → latch addr → register addr reverse index
-    /// Returns (Participant, Room) or None
+    /// Returns (Participant, PcType, Room)
     pub fn latch_by_ufrag(
         &self,
         ufrag: &str,
         addr: SocketAddr,
-    ) -> Option<(Arc<Participant>, Arc<Room>)> {
+    ) -> Option<(Arc<Participant>, PcType, Arc<Room>)> {
         let room_id = self.ufrag_index.get(ufrag)?.value().clone();
         let room = self.rooms.get(&room_id)?.value().clone();
-        let p = room.latch(ufrag, addr)?;
+        let (p, pc_type) = room.latch(ufrag, addr)?;
         self.addr_index.insert(addr, room_id);
-        Some((p, room))
+        Some((p, pc_type, room))
     }
 
-    /// SRTP hot path: addr → room → participant + room
-    /// O(1) × 2 — no iteration
-    pub fn find_by_addr(&self, addr: &SocketAddr) -> Option<(Arc<Participant>, Arc<Room>)> {
+    /// SRTP hot path: addr → room → (participant, pc_type) + room
+    /// O(1) × 2
+    pub fn find_by_addr(&self, addr: &SocketAddr) -> Option<(Arc<Participant>, PcType, Arc<Room>)> {
         let room_id = self.addr_index.get(addr)?.value().clone();
         let room = self.rooms.get(&room_id)?.value().clone();
-        let p = room.get_by_addr(addr)?;
-        Some((p, room))
+        let (p, pc_type) = room.get_by_addr(addr)?;
+        Some((p, pc_type, room))
     }
 
-    /// STUN lookup (without latch): ufrag → participant + room
-    pub fn find_by_ufrag(&self, ufrag: &str) -> Option<(Arc<Participant>, Arc<Room>)> {
+    /// STUN lookup (without latch): ufrag → (participant, pc_type, room)
+    pub fn find_by_ufrag(&self, ufrag: &str) -> Option<(Arc<Participant>, PcType, Arc<Room>)> {
         let room_id = self.ufrag_index.get(ufrag)?.value().clone();
         let room = self.rooms.get(&room_id)?.value().clone();
-        let p = room.get_by_ufrag(ufrag)?;
-        Some((p, room))
+        let (p, pc_type) = room.get_by_ufrag(ufrag)?;
+        Some((p, pc_type, room))
     }
 }

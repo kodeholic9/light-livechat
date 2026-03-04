@@ -1,12 +1,14 @@
 // author: kodeholic (powered by Claude)
-//! UDP media transport — single port, demux dispatch, RoomHub integration
+//! UDP media transport — 2PC structure, single port, demux dispatch
 //!
-//! Packet flow:
+//! 2PC 구조에서의 패킷 흐름:
 //!   recv_from(addr)
 //!     → classify (RFC 5764 first-byte)
-//!     → STUN : RoomHub.latch_by_ufrag() → Binding Response → trigger DTLS
-//!     → DTLS : DtlsSessionMap.inject() or start new handshake
-//!     → SRTP : RoomHub.find_by_addr() → decrypt → relay → encrypt → send
+//!     → STUN : RoomHub.latch_by_ufrag() → (Participant, PcType) → Binding Response → trigger DTLS
+//!     → DTLS : DtlsSessionMap.inject() or start new handshake (per PC session)
+//!     → SRTP : RoomHub.find_by_addr() → (Participant, PcType)
+//!              PcType::Publish  → decrypt → relay → encrypt → send to subscribers
+//!              PcType::Subscribe → RTCP feedback (future)
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
@@ -15,11 +17,12 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, trace, warn};
 
-use webrtc_util::conn::Conn;
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use webrtc_util::conn::Conn;
+
 use crate::config;
+use crate::room::participant::PcType;
 use crate::room::room::RoomHub;
 use crate::transport::demux::{self, PacketType};
 use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
@@ -43,7 +46,6 @@ impl DtlsSessionMap {
         self.sessions.insert(addr, tx);
     }
 
-    /// Inject packet into existing session. Returns false if no session.
     async fn inject(&self, addr: &SocketAddr, data: Bytes) -> bool {
         if let Some(tx) = self.sessions.get(addr) {
             tx.send(data).await.is_ok()
@@ -56,7 +58,6 @@ impl DtlsSessionMap {
         self.sessions.contains_key(addr)
     }
 
-    /// Periodically clean up sessions whose tx channel is closed
     fn remove_stale(&mut self) {
         self.sessions.retain(|addr, tx| {
             if tx.is_closed() {
@@ -78,9 +79,7 @@ pub struct UdpTransport {
     room_hub:     Arc<RoomHub>,
     cert:         Arc<ServerCert>,
     dtls_map:     DtlsSessionMap,
-    /// Counter for periodic stale session cleanup
     pkt_count:    u64,
-    /// [DBG] RTP hot-path packet counter (for log throttling)
     dbg_rtp_count: AtomicU64,
 }
 
@@ -103,7 +102,6 @@ impl UdpTransport {
         })
     }
 
-    /// Main receive loop — runs forever
     pub async fn run(mut self) {
         let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
 
@@ -124,7 +122,6 @@ impl UdpTransport {
                 }
             }
 
-            // Periodic cleanup (every ~1000 packets)
             self.pkt_count += 1;
             if self.pkt_count % 1000 == 0 {
                 self.dtls_map.remove_stale();
@@ -137,19 +134,16 @@ impl UdpTransport {
     // ========================================================================
 
     async fn handle_stun(&mut self, buf: &[u8], remote: SocketAddr) {
-        // Parse STUN message
         let msg = match stun::parse(buf) {
             Some(m) => m,
             None => { trace!("STUN parse failed from {}", remote); return; }
         };
 
-        // Only handle Binding Requests
         if msg.msg_type != stun::BINDING_REQUEST {
             trace!("non-binding STUN from {} type=0x{:04X}", remote, msg.msg_type);
             return;
         }
 
-        // USERNAME = "server_ufrag:client_ufrag"
         let username = match msg.username() {
             Some(u) => u,
             None => { debug!("STUN without USERNAME from {}", remote); return; }
@@ -159,27 +153,27 @@ impl UdpTransport {
             None => { debug!("invalid STUN USERNAME format: {}", username); return; }
         };
 
-        // Latch via RoomHub → registers addr reverse index
-        let (participant, _room) = match self.room_hub.latch_by_ufrag(server_ufrag, remote) {
+        // Latch → returns (Participant, PcType, Room)
+        let (participant, pc_type, _room) = match self.room_hub.latch_by_ufrag(server_ufrag, remote) {
             Some(r) => r,
             None => { debug!("unknown ufrag={} from {}", server_ufrag, remote); return; }
         };
 
         participant.touch(current_ts());
 
-        // [DBG:STUN] latch 성공
-        info!("[DBG:STUN] latch user={} ufrag={} addr={}",
-            participant.user_id, server_ufrag, remote);
+        let session = participant.session(pc_type);
 
-        // Verify MESSAGE-INTEGRITY with participant's ice_pwd
-        let integrity_key = stun::ice_integrity_key(&participant.ice_pwd);
+        info!("[DBG:STUN] latch user={} pc={} ufrag={} addr={}",
+            participant.user_id, pc_type, server_ufrag, remote);
+
+        // Verify MESSAGE-INTEGRITY with the session's ice_pwd
+        let integrity_key = stun::ice_integrity_key(&session.ice_pwd);
         if !stun::verify_message_integrity(&msg, &integrity_key) {
-            warn!("[DBG:STUN] MESSAGE-INTEGRITY mismatch user={} addr={}",
-                participant.user_id, remote);
+            warn!("[DBG:STUN] MESSAGE-INTEGRITY mismatch user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
             return;
         }
 
-        // Build and send Binding Success Response
         let response = stun::build_binding_response(
             &msg.transaction_id,
             remote,
@@ -188,29 +182,27 @@ impl UdpTransport {
         if let Err(e) = self.socket.send_to(&response, remote).await {
             error!("STUN response send failed: {e}");
         }
-        info!("[DBG:STUN] binding-response sent user={} addr={} len={}",
-            participant.user_id, remote, response.len());
+        info!("[DBG:STUN] binding-response sent user={} pc={} addr={}",
+            participant.user_id, pc_type, remote);
 
-        // USE-CANDIDATE → trigger DTLS handshake (if not already running)
+        // USE-CANDIDATE → trigger DTLS handshake for this PC session
         if msg.has_use_candidate() && !self.dtls_map.has(&remote) {
-            info!("[DBG:STUN] USE-CANDIDATE user={} addr={} → starting DTLS",
-                participant.user_id, remote);
-            self.start_dtls_handshake(remote, participant).await;
+            info!("[DBG:STUN] USE-CANDIDATE user={} pc={} addr={} → starting DTLS",
+                participant.user_id, pc_type, remote);
+            self.start_dtls_handshake(remote, participant, pc_type).await;
         }
     }
 
     // ========================================================================
-    // DTLS — handshake path
+    // DTLS — handshake path (per PC session)
     // ========================================================================
 
     async fn handle_dtls(&mut self, data: Bytes, remote: SocketAddr) {
-        // Try injecting into existing session first
         if self.dtls_map.inject(&remote, data.clone()).await {
             return;
         }
 
-        // No session yet — check if participant is latched
-        let (participant, _room) = match self.room_hub.find_by_addr(&remote) {
+        let (participant, pc_type, _room) = match self.room_hub.find_by_addr(&remote) {
             Some(r) => r,
             None => {
                 info!("[DBG:DTLS] from unlatched addr={}, dropping", remote);
@@ -218,10 +210,9 @@ impl UdpTransport {
             }
         };
 
-        // Start new session + inject the first packet
-        info!("[DBG:DTLS] new session user={} addr={} pkt_len={}",
-            participant.user_id, remote, data.len());
-        self.start_dtls_handshake(remote, participant).await;
+        info!("[DBG:DTLS] new session user={} pc={} addr={} pkt_len={}",
+            participant.user_id, pc_type, remote, data.len());
+        self.start_dtls_handshake(remote, participant, pc_type).await;
         self.dtls_map.inject(&remote, data).await;
     }
 
@@ -229,6 +220,7 @@ impl UdpTransport {
         &mut self,
         remote: SocketAddr,
         participant: Arc<crate::room::participant::Participant>,
+        pc_type: PcType,
     ) {
         let (adapter, tx) = DemuxConn::new(Arc::clone(&self.socket), remote);
         self.dtls_map.insert(remote, tx);
@@ -236,7 +228,8 @@ impl UdpTransport {
         let cert = Arc::clone(&self.cert);
 
         tokio::spawn(async move {
-            info!("[DBG:DTLS] handshake starting user={} addr={}", participant.user_id, remote);
+            info!("[DBG:DTLS] handshake starting user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
             let config = dtls::server_config(&cert);
             let conn: Arc<dyn webrtc_util::conn::Conn + Send + Sync> = Arc::new(adapter);
 
@@ -245,44 +238,48 @@ impl UdpTransport {
 
             match result {
                 Ok(Ok(dtls_conn)) => {
-                    info!("[DBG:DTLS] handshake OK user={} addr={}", participant.user_id, remote);
+                    info!("[DBG:DTLS] handshake OK user={} pc={} addr={}",
+                        participant.user_id, pc_type, remote);
                     match dtls::export_srtp_keys(&dtls_conn).await {
                         Ok(keys) => {
-                            info!("[DBG:DTLS] SRTP keys exported user={} client_key_len={} server_key_len={}",
-                                participant.user_id, keys.client_key.len(), keys.server_key.len());
-                            participant.install_srtp_keys(
+                            // Install SRTP keys on the specific session (publish or subscribe)
+                            let session = participant.session(pc_type);
+                            session.install_srtp_keys(
                                 &keys.client_key,
                                 &keys.client_salt,
                                 &keys.server_key,
                                 &keys.server_salt,
                             );
-                            info!("[DBG:DTLS] SRTP ready user={} addr={} media_ready={}",
-                                participant.user_id, remote, participant.is_media_ready());
+                            info!("[DBG:DTLS] SRTP ready user={} pc={} addr={}",
+                                participant.user_id, pc_type, remote);
                         }
                         Err(e) => {
-                            error!("[DBG:DTLS] SRTP key export FAILED user={}: {e}", participant.user_id);
+                            error!("[DBG:DTLS] SRTP key export FAILED user={} pc={}: {e}",
+                                participant.user_id, pc_type);
                         }
                     }
 
-                    // Keep DTLSConn alive — recv loop until connection ends
+                    // Keep DTLSConn alive
                     let mut keepalive_buf = vec![0u8; 1500];
                     loop {
                         match dtls_conn.recv(&mut keepalive_buf).await {
                             Ok(0) | Err(_) => break,
-                            Ok(_) => {} // application data (unused in SFU)
+                            Ok(_) => {}
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("[DBG:DTLS] handshake FAILED user={}: {e}", participant.user_id);
+                    warn!("[DBG:DTLS] handshake FAILED user={} pc={}: {e}",
+                        participant.user_id, pc_type);
                 }
                 Err(_) => {
-                    warn!("[DBG:DTLS] handshake TIMEOUT (10s) user={} addr={}", participant.user_id, remote);
+                    warn!("[DBG:DTLS] handshake TIMEOUT (10s) user={} pc={} addr={}",
+                        participant.user_id, pc_type, remote);
                 }
             }
 
-            debug!("[DBG:DTLS] session ended user={} addr={}", participant.user_id, remote);
-            // tx drops here → remove_stale() will clean up
+            debug!("[DBG:DTLS] session ended user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
         });
     }
 
@@ -293,8 +290,8 @@ impl UdpTransport {
     async fn handle_srtp(&self, buf: &[u8], remote: SocketAddr) {
         let seq_num = self.dbg_rtp_count.fetch_add(1, Ordering::Relaxed);
 
-        // O(1) lookup: addr → participant + room
-        let (sender, room) = match self.room_hub.find_by_addr(&remote) {
+        // O(1) lookup: addr → (participant, pc_type, room)
+        let (sender, pc_type, room) = match self.room_hub.find_by_addr(&remote) {
             Some(r) => r,
             None => {
                 if seq_num < config::DBG_DETAIL_LIMIT {
@@ -306,7 +303,17 @@ impl UdpTransport {
 
         sender.touch(current_ts());
 
-        if !sender.is_media_ready() {
+        // Only process media from publish PC
+        if pc_type != PcType::Publish {
+            // Subscribe PC에서 오는 SRTP는 RTCP feedback (future Phase)
+            if seq_num < config::DBG_DETAIL_LIMIT {
+                trace!("[DBG:RTP] from subscribe PC user={} addr={} (RTCP feedback — ignored)",
+                    sender.user_id, remote);
+            }
+            return;
+        }
+
+        if !sender.publish.is_media_ready() {
             if seq_num < config::DBG_DETAIL_LIMIT {
                 info!("[DBG:RTP] before DTLS complete user={} addr={}", sender.user_id, remote);
             }
@@ -321,7 +328,7 @@ impl UdpTransport {
         if is_rtcp {
             let rtcp_pt = buf.get(1).map(|b| b & 0x7F).unwrap_or(0);
             let rtcp_ssrc = parse_ssrc(buf);
-            let mut ctx = sender.inbound_srtp.lock().unwrap();
+            let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
             match ctx.decrypt_rtcp(buf) {
                 Ok(plain) => {
                     if seq_num < config::DBG_DETAIL_LIMIT {
@@ -330,16 +337,18 @@ impl UdpTransport {
                     }
                 }
                 Err(e) => {
-                    info!("[DBG:RTCP] decrypt FAILED user={} pt={} ssrc=0x{:08X}: {e}",
-                        sender.user_id, rtcp_pt, rtcp_ssrc);
+                    if seq_num < config::DBG_DETAIL_LIMIT {
+                        info!("[DBG:RTCP] decrypt FAILED user={} pt={} ssrc=0x{:08X}: {e}",
+                            sender.user_id, rtcp_pt, rtcp_ssrc);
+                    }
                 }
             }
-            return; // don't relay RTCP
+            return; // RTCP relay — Phase C
         }
 
-        // Decrypt SRTP → plaintext RTP
+        // Decrypt SRTP → plaintext RTP (from publish session)
         let plaintext = {
-            let mut ctx = sender.inbound_srtp.lock().unwrap();
+            let mut ctx = sender.publish.inbound_srtp.lock().unwrap();
             match ctx.decrypt_rtp(buf) {
                 Ok(p) => p,
                 Err(e) => {
@@ -368,13 +377,13 @@ impl UdpTransport {
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
 
-        // Fan-out: relay to all other media-ready participants in the room
+        // Fan-out: relay to all other participants via their SUBSCRIBE session
         let targets = room.other_participants(&sender.user_id);
 
         if is_detail {
             let target_info: Vec<String> = targets.iter()
-                .filter(|t| t.is_media_ready())
-                .map(|t| format!("{}@{}", t.user_id, t.get_address()
+                .filter(|t| t.is_subscribe_ready())
+                .map(|t| format!("{}@{}", t.user_id, t.subscribe.get_address()
                     .map(|a| a.to_string()).unwrap_or("none".into())))
                 .collect();
             info!("[DBG:RELAY] #{} from={} targets=[{}]",
@@ -383,15 +392,16 @@ impl UdpTransport {
 
         let mut relay_count = 0u32;
         for target in &targets {
-            if !target.is_media_ready() { continue; }
+            // Use subscribe session for sending media TO the target
+            if !target.is_subscribe_ready() { continue; }
 
-            let addr = match target.get_address() {
+            let addr = match target.subscribe.get_address() {
                 Some(a) => a,
                 None => continue,
             };
 
             let encrypted = {
-                let mut ctx = target.outbound_srtp.lock().unwrap();
+                let mut ctx = target.subscribe.outbound_srtp.lock().unwrap();
                 match ctx.encrypt_rtp(&plaintext) {
                     Ok(p) => p,
                     Err(e) => {
@@ -434,10 +444,6 @@ fn current_ts() -> u64 {
         .as_millis() as u64
 }
 
-// ============================================================================
-// [DBG] RTP header parser (logging only)
-// ============================================================================
-
 struct RtpHeader {
     pt:         u8,
     marker:     bool,
@@ -463,7 +469,6 @@ fn parse_rtp_header(buf: &[u8]) -> RtpHeader {
     }
 }
 
-/// Parse SSRC at offset 4 (RTCP) — for logging
 fn parse_ssrc(buf: &[u8]) -> u32 {
     if buf.len() < 8 { return 0; }
     u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]])
