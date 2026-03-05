@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.4] - 2026-03-05
+
+### Added (Media Quality: REMB + RR relay fix + JB delta)
+
+#### 서버
+- `build_remb()` + `encode_remb_bitrate()` — 서버 자체 REMB 패킷 생성 (24바이트, draft-alvestrand-rmcat-remb)
+- `send_remb_to_publishers()` — 1초 주기 REMB 전송 (Chrome BWE 대역폭 힌트)
+- `run()` 루프에 `remb_timer` 추가 (tokio::select 3분기)
+- `config.rs`: `REMB_INTERVAL_MS`(1000), `REMB_BITRATE_BPS`(500000)
+- subscribe RTCP 진단 카운터 3종 추가 (sub_rtcp_received/not_rtcp/decrypted)
+
+### Fixed
+- **RR relay metrics 카운터 버그** — plaintext RTCP PT에 `& 0x7F` 마스크 적용하여 `201 & 0x7F = 73 ≠ 201` 로 rr_relayed 항상 0
+- **subscribe RTCP decrypt_fail 카운터 누락** — 복호화 실패 시 metrics에 반영 안 됨
+- **transport-wide-cc extmap 제거** — TWCC 선언 시 Chrome BWE가 REMB 무시하여 available_bitrate 84kbps 고정
+
+#### 클라이언트 SDK
+- `jitterBufferDelay` delta 계산 전환 (누적값 → 3초 윈도우 평균 ms)
+- `_prevStats.jb` Map 추가 (SSRC별 이전 delay/emitted 저장)
+
+#### 어드민
+- jb_delay 표시/판정을 SDK delta ms 직접 사용으로 변경 (3곳)
+
+### 결과
+- available_bitrate: 84kbps → 500kbps
+- video bitrate: 32kbps → 470kbps
+- quality_limit: bandwidth → none
+- jb_delay: 170ms(가속) → 44~63ms(안정)
+- Contract: 4/8 PASS → 7/8 PASS
+
+### 설계 결정
+- TWCC 구현 전까지 REMB 모드로 동작 (extmap에서 twcc 제외)
+- REMB 500kbps는 로컬 테스트용, 실환경에서는 config에서 조정
+
 ## [0.3.3] - 2026-03-05
 
 ### Added (Phase T-4/5: 시계열 차트 + Contract + 스냅샷)

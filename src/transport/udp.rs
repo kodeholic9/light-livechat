@@ -115,6 +115,10 @@ struct ServerMetrics {
     sr_relayed:     u64,
     rr_relayed:     u64,
     twcc_sent:      u64,
+    // subscribe RTCP 진단 카운터
+    sub_rtcp_received: u64,  // handle_subscribe_rtcp 진입
+    sub_rtcp_not_rtcp: u64,  // is_rtcp 필터된 횟수
+    sub_rtcp_decrypted: u64, // 복호화 성공
 }
 
 impl ServerMetrics {
@@ -137,6 +141,9 @@ impl ServerMetrics {
             sr_relayed:     0,
             rr_relayed:     0,
             twcc_sent:      0,
+            sub_rtcp_received: 0,
+            sub_rtcp_not_rtcp: 0,
+            sub_rtcp_decrypted: 0,
         }
     }
 
@@ -170,6 +177,9 @@ impl ServerMetrics {
             "sr_relayed":     self.sr_relayed,
             "rr_relayed":     self.rr_relayed,
             "twcc_sent":      self.twcc_sent,
+            "sub_rtcp_received": self.sub_rtcp_received,
+            "sub_rtcp_not_rtcp": self.sub_rtcp_not_rtcp,
+            "sub_rtcp_decrypted": self.sub_rtcp_decrypted,
         })
     }
 
@@ -191,6 +201,9 @@ impl ServerMetrics {
         self.sr_relayed = 0;
         self.rr_relayed = 0;
         self.twcc_sent = 0;
+        self.sub_rtcp_received = 0;
+        self.sub_rtcp_not_rtcp = 0;
+        self.sub_rtcp_decrypted = 0;
     }
 }
 
@@ -300,6 +313,12 @@ impl UdpTransport {
         );
         metrics_timer.tick().await; // 첨 tick 소비
 
+        // REMB 전송 타이머 (1초 주기)
+        let mut remb_timer = tokio::time::interval(
+            tokio::time::Duration::from_millis(config::REMB_INTERVAL_MS),
+        );
+        remb_timer.tick().await; // 첨 tick 소비
+
         loop {
             tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
@@ -327,6 +346,9 @@ impl UdpTransport {
                 _ = metrics_timer.tick() => {
                     self.flush_metrics();
                 }
+                _ = remb_timer.tick() => {
+                    self.send_remb_to_publishers().await;
+                }
             }
         }
     }
@@ -336,6 +358,58 @@ impl UdpTransport {
         let json = self.metrics.to_json();
         let _ = self.admin_tx.send(json.to_string());
         self.metrics.reset();
+    }
+
+    // ========================================================================
+    // REMB — 서버 자체 대역폭 힌트 (1초 주기)
+    // ========================================================================
+
+    /// 모든 room의 모든 publisher에게 REMB 전송
+    /// Chrome BWE에게 "이 만큼까지 보내도 된다"는 힌트를 제공
+    async fn send_remb_to_publishers(&mut self) {
+        use crate::room::participant::TrackKind;
+
+        for room_entry in self.room_hub.rooms.iter() {
+            let room = room_entry.value();
+
+            for entry in room.participants.iter() {
+                let publisher = entry.value();
+                if !publisher.is_publish_ready() { continue; }
+
+                let pub_addr = match publisher.publish.get_address() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                // video 트랙 SSRC 찾기
+                let video_ssrc = {
+                    let tracks = publisher.tracks.lock().unwrap();
+                    tracks.iter()
+                        .find(|t| t.kind == TrackKind::Video)
+                        .map(|t| t.ssrc)
+                };
+
+                let ssrc = match video_ssrc {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let remb_plain = build_remb(config::REMB_BITRATE_BPS, ssrc);
+
+                // SRTCP 암호화 (publisher의 publish session outbound context)
+                let encrypted = {
+                    let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtcp(&remb_plain) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                };
+
+                if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
+                    debug!("[REMB] send FAILED user={} addr={}: {e}", publisher.user_id, pub_addr);
+                }
+            }
+        }
     }
 
     // ========================================================================
@@ -699,6 +773,7 @@ impl UdpTransport {
         seq_num: u64,
     ) {
         let is_detail = seq_num < config::DBG_DETAIL_LIMIT;
+        self.metrics.sub_rtcp_received += 1;
 
         // RTCP인지 확인 (RFC 5761: PT 72-79)
         let is_rtcp = buf.get(1)
@@ -706,9 +781,12 @@ impl UdpTransport {
             .unwrap_or(false);
 
         if !is_rtcp {
+            self.metrics.sub_rtcp_not_rtcp += 1;
             if is_detail {
-                trace!("[DBG:SUB] non-RTCP from subscribe PC user={} addr={}",
-                    subscriber.user_id, remote);
+                trace!("[DBG:SUB] non-RTCP from subscribe PC user={} addr={} byte0=0x{:02X} byte1=0x{:02X}",
+                    subscriber.user_id, remote,
+                    buf.get(0).copied().unwrap_or(0),
+                    buf.get(1).copied().unwrap_or(0));
             }
             return;
         }
@@ -717,8 +795,12 @@ impl UdpTransport {
         let plaintext = {
             let mut ctx = subscriber.subscribe.inbound_srtp.lock().unwrap();
             match ctx.decrypt_rtcp(buf) {
-                Ok(p) => p,
+                Ok(p) => {
+                    self.metrics.sub_rtcp_decrypted += 1;
+                    p
+                }
                 Err(e) => {
+                    self.metrics.decrypt_fail += 1;
                     if is_detail {
                         debug!("[DBG:RTCP:SUB] SRTCP decrypt FAILED user={} addr={}: {e}",
                             subscriber.user_id, remote);
@@ -731,6 +813,11 @@ impl UdpTransport {
         // Compound RTCP 파싱: NACK 분리 + publisher별 릴레이 대상 수집
         let parsed = split_compound_rtcp(&plaintext);
 
+        if is_detail {
+            debug!("[DBG:RTCP:SUB] user={} compound_len={} nack_blocks={} relay_blocks={}",
+                subscriber.user_id, plaintext.len(), parsed.nack_blocks.len(), parsed.relay_blocks.len());
+        }
+
         // (1) NACK 처리 (RTX 재전송 — 기존 로직)
         self.metrics.nack_received += parsed.nack_blocks.len() as u64;
         for nack_block in &parsed.nack_blocks {
@@ -742,9 +829,9 @@ impl UdpTransport {
             return;
         }
 
-        // RR/PLI relay count
+        // RR/PLI relay count — plaintext는 이미 복호화된 RTCP이므로 & 0x7F 마스크 불필요
         for block in &parsed.relay_blocks {
-            let pt = plaintext.get(block.offset + 1).map(|b| b & 0x7F).unwrap_or(0);
+            let pt = plaintext.get(block.offset + 1).copied().unwrap_or(0);
             if pt == config::RTCP_PT_RR { self.metrics.rr_relayed += 1; }
             if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent += 1; }
         }
@@ -802,9 +889,11 @@ impl UdpTransport {
                     debug!("[DBG:RTCP:SUB] relay send FAILED ssrc=0x{:08X} addr={}: {e}",
                         media_ssrc, pub_addr);
                 }
-            } else if is_detail {
-                debug!("[DBG:RTCP:SUB] relayed {} block(s) ssrc=0x{:08X} → user={} addr={}",
-                    blocks.len(), media_ssrc, publisher.user_id, pub_addr);
+            } else {
+                if is_detail {
+                    debug!("[DBG:RTCP:SUB] relayed {} block(s) ssrc=0x{:08X} → user={} addr={}",
+                        blocks.len(), media_ssrc, publisher.user_id, pub_addr);
+                }
             }
         }
     }
@@ -1235,6 +1324,80 @@ pub fn build_pli(media_ssrc: u32) -> [u8; 12] {
     // SSRC of media source
     buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
     buf
+}
+
+// ============================================================================
+// RTCP REMB builder (draft-alvestrand-rmcat-remb)
+// ============================================================================
+//
+//  0               1               2               3
+//  0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |V=2|P| FMT=15 |   PT=206      |          length=5             |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                  SSRC of packet sender (0)                   |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |                  SSRC of media source (0)                    |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |  'R' 'E' 'M' 'B'                                            |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// | Num SSRC=1  | BR Exp  |  BR Mantissa (18 bits)              |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |   SSRC feedback (video SSRC)                                 |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+/// 서버 자체 REMB 패킷 생성 (24바이트 고정, SSRC 1개)
+///
+/// Chrome의 goog-remb rtcp_fb에 대응. 서버가 publisher에게
+/// "이 만큼까지 보내도 된다"는 대역폭 힌트를 제공한다.
+fn build_remb(bitrate_bps: u64, media_ssrc: u32) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+
+    // V=2, P=0, FMT=15 → 0b10_0_01111 = 0x8F
+    buf[0] = 0x8F;
+    // PT=206 (PSFB)
+    buf[1] = 206;
+    // length=5 (24 bytes / 4 - 1)
+    buf[2] = 0;
+    buf[3] = 5;
+    // SSRC of sender = 0
+    // buf[4..8] already 0
+    // SSRC of media source = 0
+    // buf[8..12] already 0
+
+    // 'R' 'E' 'M' 'B'
+    buf[12] = b'R';
+    buf[13] = b'E';
+    buf[14] = b'M';
+    buf[15] = b'B';
+
+    // Num SSRC = 1, BR Exp (6 bits), BR Mantissa (18 bits)
+    // bitrate_bps = mantissa * 2^exp
+    let (exp, mantissa) = encode_remb_bitrate(bitrate_bps);
+
+    // Byte 16: Num SSRC (1)
+    // Byte 16-19: [num_ssrc:8][exp:6][mantissa:18]
+    buf[16] = 1; // num SSRC
+    buf[17] = (exp << 2) | ((mantissa >> 16) as u8 & 0x03);
+    buf[18] = (mantissa >> 8) as u8;
+    buf[19] = mantissa as u8;
+
+    // SSRC feedback
+    buf[20..24].copy_from_slice(&media_ssrc.to_be_bytes());
+
+    buf
+}
+
+/// REMB 비트레이트 인코딩: bps → (exp, mantissa)
+/// mantissa * 2^exp = bps, mantissa는 18비트 이하
+fn encode_remb_bitrate(bps: u64) -> (u8, u32) {
+    let mut exp: u8 = 0;
+    let mut mantissa = bps;
+    while mantissa > 0x3FFFF { // 18 bits max = 262143
+        mantissa >>= 1;
+        exp += 1;
+    }
+    (exp, mantissa as u32)
 }
 
 /// Subscribe SRTP ready 시 해당 room의 모든 publisher에게 PLI 전송

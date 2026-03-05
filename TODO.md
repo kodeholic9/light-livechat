@@ -108,7 +108,12 @@
 - [x] REMB 처리 (대역폭 추정 전달) — v0.2.2
 - [x] PLI 클라이언트 발 → 해당 publisher에 전달 — v0.2.2
 - [x] mute/unmute 이벤트 처리 (시그널링 + 브로드캐스트) — v0.2.3
-- [ ] VP8 키프레임 캠시 (LRU) 검토
+- [x] 서버 자체 REMB 생성 (Chrome BWE 대역폭 힌트) — v0.3.4
+- [x] RR relay metrics 카운터 버그 수정 — v0.3.4
+- [x] transport-wide-cc extmap 제거 (TWCC 구현 전 REMB 모드) — v0.3.4
+- [x] SDK jitterBufferDelay delta 계산 전환 — v0.3.4
+- [ ] TWCC feedback 생성 (서버, REMB 대체)
+- [ ] VP8 키프레임 캐시 (LRU) 검토
   - RTP payload에서 VP8 I-frame 감지 (RFC 7741 descriptor + bit0)
   - publisher별 마지막 키프레임 RTP 패킷 묶음(same timestamp) 캐시
   - 새 구독자 입장 시 캐시된 키프레임 즉시 전달 (PLI 왕복 없이 200ms 이내)

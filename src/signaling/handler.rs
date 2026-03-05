@@ -714,11 +714,14 @@ fn server_codec_policy() -> serde_json::Value {
 }
 
 fn server_extmap_policy() -> serde_json::Value {
+    // Note: transport-wide-cc (id=6) 의도적 제외
+    // TWCC를 선언하면 Chrome BWE가 TWCC 모드로 전환하여 REMB를 무시한다.
+    // 서버가 TWCC feedback을 생성하지 않으면 BWE가 초기값(84kbps)에 고정된다.
+    // TWCC 구현 전까지 REMB 모드로 동작시켜 서버 자체 REMB로 BWE를 제어한다.
     serde_json::json!([
         { "id": 1, "uri": "urn:ietf:params:rtp-hdrext:sdes:mid" },
         { "id": 4, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level" },
-        { "id": 5, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" },
-        { "id": 6, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" }
+        { "id": 5, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" }
     ])
 }
 

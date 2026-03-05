@@ -65,6 +65,12 @@ pub const RTCP_FMT_PLI: u8 = 1;
 /// REMB feedback message type (FMT=15)
 pub const RTCP_FMT_REMB: u8 = 15;
 
+// --- REMB (Server-generated) ---
+/// 서버 자체 REMB 전송 주기 (ms) — publisher에게 대역폭 힘트 제공
+pub const REMB_INTERVAL_MS: u64 = 1_000;
+/// 서버 REMB 권장 비트레이트 (bps) — Chrome BWE의 상한 힌트
+pub const REMB_BITRATE_BPS: u64 = 500_000;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

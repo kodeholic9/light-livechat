@@ -202,6 +202,7 @@ async-trait = "0.1"
 | T-2 | Media Telemetry 2단계 (서버 B구간 계측) | 0.3.1 | ✅ |
 | T-3 | Media Telemetry 3단계 (어드민 SFU 서버 패널 + server_metrics 표시) | 0.3.2 | ✅ |
 | T-4/5 | Media Telemetry 4+5 (시계열 차트 + Contract + 스냅샷) | 0.3.3 | ✅ |
+| Q | Media Quality (REMB + RR fix + JB delta) | 0.3.4 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -276,6 +277,14 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.3.4 — Media Quality (REMB + RR relay fix + JB delta)
+- 서버 자체 REMB 생성 (1초 주기) — Chrome BWE 대역폭 힌트
+- transport-wide-cc extmap 제거 → REMB 모드 전환 (TWCC 구현 전까지)
+- RR relay metrics 카운터 버그 수정 (`& 0x7F` 마스크 on plaintext)
+- SDK: jitterBufferDelay 누적값 → 3초 delta ms 전환
+- 어드민: jb_delay 표시/Contract 판정 SDK delta 직접 사용
+- available_bitrate 84kbps → 500kbps, Contract 4/8 → 7/8
 
 ### v0.3.3 — 시계열 차트 + Contract + 스냅샷 (Phase T-4/5)
 - **어드민**: Canvas 시계열 차트 (3모드: 패킷 흐름, 품질 지표, SFU 내부)
