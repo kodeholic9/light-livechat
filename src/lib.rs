@@ -39,16 +39,59 @@ impl FormatTime for LocalTimer {
 
 /// Run the SFU server
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "light_livechat=info".into()),
-        )
-        .with_timer(LocalTimer)
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(false)
-        .init();
+    // ========================================================================
+    // 1. .env 파일 탐색
+    //    --env /path  → 해당 경로 (없으면 에러)
+    //    인자 없음    → CWD/.env → 실행파일 디렉토리/.env → 둘 다 없으면 환경변수/기본값
+    // ========================================================================
+    load_env_file();
+
+    // ========================================================================
+    // 2. 설정값 로드 (fallback: config 상수 / 자동 감지)
+    // ========================================================================
+    let ws_port: u16 = env_or("WS_PORT", config::WS_PORT);
+    let udp_port: u16 = env_or("UDP_PORT", config::UDP_PORT);
+    let public_ip: String = std::env::var("PUBLIC_IP")
+        .unwrap_or_else(|_| detect_local_ip());
+    let log_dir: Option<String> = std::env::var("LOG_DIR").ok()
+        .filter(|d| !d.is_empty() && std::path::Path::new(d).is_dir());
+    let log_level: String = std::env::var("LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string());
+
+    // ========================================================================
+    // 3. tracing 초기화 (LOG_DIR 있으면 일별 로테이션 파일 + 콘솔, 없으면 콘솔만)
+    // ========================================================================
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("light_livechat={}", log_level).into());
+
+    if let Some(ref dir) = log_dir {
+        // 일별 로테이션 파일 (livechatd.YYYY-MM-DD.log)
+        let file_appender = tracing_appender::rolling::daily(dir, "livechatd.log");
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        // _guard를 들고 있어야 flush됨 — Box::leak으로 프로세스 수명 동안 유지
+        Box::leak(Box::new(_guard));
+
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_timer(LocalTimer)
+            .with_file(true)
+            .with_line_number(true)
+            .with_target(false)
+            .with_writer(non_blocking)
+            .with_ansi(false) // 파일에는 ANSI 색상 코드 제거
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_timer(LocalTimer)
+            .with_file(true)
+            .with_line_number(true)
+            .with_target(false)
+            .init();
+    }
+
+    info!("config: PUBLIC_IP={} WS_PORT={} UDP_PORT={} LOG_DIR={}",
+        public_ip, ws_port, udp_port, log_dir.as_deref().unwrap_or("(stdout)"));
 
     // Generate DTLS server certificate (once per instance)
     let cert = ServerCert::generate()?;
@@ -56,13 +99,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start UDP transport (socket 먼저 생성 → AppState에 공유)
     let udp_socket = {
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config::UDP_PORT));
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], udp_port));
         Arc::new(tokio::net::UdpSocket::bind(addr).await?)
     };
-    info!("UDP listening on port {}", config::UDP_PORT);
+    info!("UDP listening on port {}", udp_port);
 
-    // Build shared state (udp_socket 포함)
-    let state = AppState::new(cert, Arc::clone(&udp_socket));
+    // Build shared state
+    let state = AppState::new(cert, Arc::clone(&udp_socket), public_ip, ws_port, udp_port);
 
     // Create default rooms
     create_default_rooms(&state);
@@ -95,7 +138,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/ws", axum::routing::get(handler::admin_ws_handler))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config::WS_PORT));
+    let addr = SocketAddr::from(([0, 0, 0, 0], ws_port));
     info!("light-livechat v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -115,6 +158,84 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+// ============================================================================
+// .env 파일 탐색 + 헬퍼
+// ============================================================================
+
+/// .env 파일 탐색 및 로드
+///
+/// 우선순위:
+///   1. `--env /path/to/.env` CLI 인자 → 해당 경로 (없으면 에러 출력 후 무시)
+///   2. CWD/.env
+///   3. 실행파일 디렉토리/.env
+///   4. 모두 없으면 환경변수/기본값으로 동작
+fn load_env_file() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --env /path 인자 처리
+    if let Some(pos) = args.iter().position(|a| a == "--env") {
+        if let Some(path) = args.get(pos + 1) {
+            match dotenvy::from_path(std::path::Path::new(path)) {
+                Ok(_) => {
+                    eprintln!("[env] loaded: {}", path);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[env] WARN: --env {} failed: {}", path, e);
+                    // fallback으로 계속
+                }
+            }
+        } else {
+            eprintln!("[env] WARN: --env requires a path argument");
+        }
+    }
+
+    // CWD/.env
+    if dotenvy::dotenv().is_ok() {
+        eprintln!("[env] loaded: .env (CWD)");
+        return;
+    }
+
+    // 실행파일 디렉토리/.env
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let env_path = dir.join(".env");
+            if env_path.is_file() {
+                match dotenvy::from_path(&env_path) {
+                    Ok(_) => {
+                        eprintln!("[env] loaded: {}", env_path.display());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[env] WARN: {} failed: {}", env_path.display(), e);
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("[env] no .env file found, using environment variables / defaults");
+}
+
+/// 환경변수에서 값 로드, 실패 시 기본값 반환
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 라우팅 테이블 기반 로컬 IP 감지 (PUBLIC_IP 미설정 시 fallback)
+fn detect_local_ip() -> String {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 /// 서버 기동 시 기본 방 생성 (테스트/개발용)

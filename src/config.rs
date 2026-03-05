@@ -45,7 +45,7 @@ pub const UDP_RECV_BUF_SIZE: usize = 2048;
 
 // --- RTX (RFC 4588) ---
 /// RTP 캐시 링버퍼 크기 (seq % SIZE로 인덱싱, 약 4초분 @30fps)
-pub const RTP_CACHE_SIZE: usize = 128;
+pub const RTP_CACHE_SIZE: usize = 512;
 /// RTX payload type (server_codec_policy의 rtx_pt와 일치해야 함)
 pub const RTX_PAYLOAD_TYPE: u8 = 97;
 /// NACK RTCP payload type (RFC 4585, Generic NACK)

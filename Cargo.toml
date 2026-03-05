@@ -47,6 +47,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 
+# env
+dotenvy = "0.15"
+
+# log file rotation
+tracing-appender = "0.2"
+
 # utils
 uuid = { version = "1", features = ["v4"] }
 getrandom = { version = "0.3", features = ["std"] }

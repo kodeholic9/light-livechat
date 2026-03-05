@@ -20,16 +20,31 @@ pub struct AppState {
     pub udp_socket: Arc<UdpSocket>,
     /// Admin telemetry broadcast (sender side, receivers subscribe via .subscribe())
     pub admin_tx:   broadcast::Sender<String>,
+    /// ICE candidate에 노출할 공인 IP (.env PUBLIC_IP 또는 자동 감지)
+    pub public_ip:  String,
+    /// WebSocket 시그널링 포트
+    pub ws_port:    u16,
+    /// UDP 미디어 포트
+    pub udp_port:   u16,
 }
 
 impl AppState {
-    pub fn new(cert: ServerCert, udp_socket: Arc<UdpSocket>) -> Self {
+    pub fn new(
+        cert: ServerCert,
+        udp_socket: Arc<UdpSocket>,
+        public_ip: String,
+        ws_port: u16,
+        udp_port: u16,
+    ) -> Self {
         let (admin_tx, _) = broadcast::channel(ADMIN_CHANNEL_SIZE);
         Self {
             rooms:      Arc::new(RoomHub::new()),
             cert:       Arc::new(cert),
             udp_socket,
             admin_tx,
+            public_ip,
+            ws_port,
+            udp_port,
         }
     }
 }

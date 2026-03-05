@@ -342,11 +342,10 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
     // Admin snapshot push (room 변경 시)
     push_admin_snapshot(state);
 
-    // Detect local IP for ICE candidate
-    let local_ip = detect_local_ip();
     let members: Vec<String> = room.member_ids();
 
     // Build server_config response (SDP-free!)
+    // IP/port는 AppState에서 (.env PUBLIC_IP / UDP_PORT fallback)
     Packet::ok(opcode::ROOM_JOIN, packet.pid, serde_json::json!({
         "room_id": req.room_id,
         "participants": members,
@@ -356,8 +355,8 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
                 "publish_pwd": pub_ice.pwd,
                 "subscribe_ufrag": sub_ice.ufrag,
                 "subscribe_pwd": sub_ice.pwd,
-                "ip": local_ip,
-                "port": config::UDP_PORT,
+                "ip": state.public_ip,
+                "port": state.udp_port,
             },
             "dtls": {
                 "fingerprint": state.cert.fingerprint,
@@ -766,17 +765,6 @@ fn current_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-/// 라우팅 테이블 기반 로컬 IP 감지
-fn detect_local_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 // ============================================================================
