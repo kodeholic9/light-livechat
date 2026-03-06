@@ -6,6 +6,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [0.3.7] - 2026-03-07
 
+### Changed (udp.rs 모듈 분할 리팩토링)
+- `transport/udp.rs` (53KB 단일 파일) → `transport/udp/` 디렉토리 5파일 분할
+  - `mod.rs` (17KB): UdpTransport 본체 + run() + STUN + DTLS + worker
+  - `ingress.rs` (16KB): handle_srtp + subscribe_rtcp + NACK + SR relay
+  - `egress.rs` (6KB): egress task + PLI/REMB 전송
+  - `rtcp.rs` (12KB): RTCP/RTP 파싱, RTX/PLI/REMB 빌더, 유틸
+  - `metrics.rs` (6KB): TimingStat + ServerMetrics
+- 기능 변경 없음 (순수 파일 분할, 동작 동일)
+- `build_pli` pub re-export 유지 (handler.rs에서 참조)
+
 ### Added (Phase W-3: Subscriber Egress Task — LiveKit 패턴)
 
 #### 서버

@@ -118,8 +118,12 @@ src/
 │   ├── demux_conn.rs       Conn trait adapter (mpsc ↔ DTLSConn bridge)
 │   ├── dtls.rs             DTLS (cert, fingerprint, handshake, key export)
 │   ├── srtp.rs             SRTP context (encrypt/decrypt)
-│   ├── sdp.rs              SDP Offer parsing + Answer generation
-│   └── udp.rs              Single-port UDP loop + RoomHub integration
+│   └── udp/                Single-port UDP loop + RoomHub integration
+│       ├── mod.rs           UdpTransport 본체 + run() + STUN + DTLS + worker
+│       ├── ingress.rs       Publish RTP/RTCP 수신 (hot path)
+│       ├── egress.rs        Subscriber 송신 (egress task, PLI, REMB)
+│       ├── rtcp.rs          RTCP/RTP 파싱·조립 헬퍼 (NACK, RTX, PLI, REMB)
+│       └── metrics.rs       B구간 계측 (TimingStat, ServerMetrics)
 ├── media/
 │   ├── router.rs           SSRC routing table
 │   └── track.rs            Track context

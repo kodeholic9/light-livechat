@@ -1,0 +1,446 @@
+// author: kodeholic (powered by Claude)
+//! UDP media transport — 2PC structure, single port, demux dispatch
+//!
+//! 2PC 구조에서의 패킷 흐름:
+//!   recv_from(addr)
+//!     → classify (RFC 5764 first-byte)
+//!     → STUN : RoomHub.latch_by_ufrag() → (Participant, PcType) → Binding Response → trigger DTLS
+//!     → DTLS : DtlsSessionMap.inject() or start new handshake (per PC session)
+//!     → SRTP : RoomHub.find_by_addr() → (Participant, PcType)
+//!              PcType::Publish  → decrypt → relay → encrypt → send to subscribers
+//!              PcType::Subscribe → NACK(RTX) + RTCP relay(RR/PLI/REMB)
+//!
+//! 모듈 구조:
+//!   mod.rs      — UdpTransport 본체 + run() + STUN + DTLS + worker
+//!   ingress.rs  — publish RTP/RTCP 수신 처리 (hot path)
+//!   egress.rs   — subscriber 방향 송신 (egress task, PLI, REMB)
+//!   rtcp.rs     — RTCP/RTP 패킷 파싱 및 조립 헬퍼
+//!   metrics.rs  — B구간 계측 (TimingStat, ServerMetrics)
+
+mod metrics;
+mod rtcp;
+mod ingress;
+mod egress;
+
+// Re-exports for external use
+pub use rtcp::build_pli;
+
+use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
+use tracing::{debug, error, info, trace, warn};
+// 로그 레벨 정책:
+//   info!  = 운영 필수 (연결/해제, 에러, 상태 전환)
+//   debug! = 진단용 상세 (패킷 단위 로그 앞 50건)
+//   trace! = 패킷 레벨 상세 (요약 로그 포함)
+
+use webrtc_util::conn::Conn;
+
+use crate::config;
+use crate::room::participant::PcType;
+use crate::room::room::RoomHub;
+use crate::transport::demux::{self, PacketType};
+use crate::transport::demux_conn::{DemuxConn, DtlsPacketTx};
+use crate::transport::dtls::{self, ServerCert};
+use crate::transport::stun;
+
+use metrics::ServerMetrics;
+use rtcp::current_ts;
+use egress::{run_egress_task, send_pli_to_publishers};
+
+// ============================================================================
+// DTLS Session Map (addr → packet channel)
+// ============================================================================
+
+struct DtlsSessionMap {
+    sessions: HashMap<SocketAddr, DtlsPacketTx>,
+}
+
+impl DtlsSessionMap {
+    fn new() -> Self {
+        Self { sessions: HashMap::new() }
+    }
+
+    fn insert(&mut self, addr: SocketAddr, tx: DtlsPacketTx) {
+        self.sessions.insert(addr, tx);
+    }
+
+    async fn inject(&self, addr: &SocketAddr, data: Bytes) -> bool {
+        if let Some(tx) = self.sessions.get(addr) {
+            tx.send(data).await.is_ok()
+        } else {
+            false
+        }
+    }
+
+    fn has(&self, addr: &SocketAddr) -> bool {
+        self.sessions.contains_key(addr)
+    }
+
+    fn remove_stale(&mut self) {
+        self.sessions.retain(|addr, tx| {
+            if tx.is_closed() {
+                debug!("stale DTLS session removed addr={}", addr);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+// ============================================================================
+// UdpTransport
+// ============================================================================
+
+pub struct UdpTransport {
+    pub socket:                 Arc<UdpSocket>,
+    pub(crate) room_hub:       Arc<RoomHub>,
+    pub(crate) cert:           Arc<ServerCert>,
+    dtls_map:                  DtlsSessionMap,
+    pub(crate) pkt_count:      u64,
+    pub(crate) dbg_rtp_count:  AtomicU64,
+    pub(crate) metrics:        ServerMetrics,
+    pub(crate) admin_tx:       broadcast::Sender<String>,
+    // Phase W-1: spawn fan-out atomic counters
+    pub(crate) spawn_rtp_relayed:  Arc<AtomicU64>,
+    pub(crate) spawn_sr_relayed:   Arc<AtomicU64>,
+    pub(crate) spawn_encrypt_fail: Arc<AtomicU64>,
+    // Phase W-2: multi-worker
+    pub(crate) worker_id: u8,
+}
+
+impl UdpTransport {
+    pub async fn bind(
+        room_hub: Arc<RoomHub>,
+        cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
+    ) -> std::io::Result<Self> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], config::UDP_PORT));
+        let socket = UdpSocket::bind(addr).await?;
+        info!("UDP transport bound on {}", addr);
+
+        Ok(Self {
+            socket: Arc::new(socket),
+            room_hub,
+            cert,
+            dtls_map: DtlsSessionMap::new(),
+            pkt_count: 0,
+            dbg_rtp_count: AtomicU64::new(0),
+            metrics: ServerMetrics::new(),
+            admin_tx,
+            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
+            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
+            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
+            worker_id: 0,
+        })
+    }
+
+    /// 외부에서 생성된 socket을 받아 구성 (AppState와 socket 공유 시)
+    pub fn from_socket(
+        socket:   Arc<UdpSocket>,
+        room_hub: Arc<RoomHub>,
+        cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
+    ) -> Self {
+        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0)
+    }
+
+    /// Phase W-2: worker_id 지정 생성자
+    pub fn from_socket_with_id(
+        socket:   Arc<UdpSocket>,
+        room_hub: Arc<RoomHub>,
+        cert:     Arc<ServerCert>,
+        admin_tx: broadcast::Sender<String>,
+        worker_id: u8,
+    ) -> Self {
+        Self {
+            socket,
+            room_hub,
+            cert,
+            dtls_map: DtlsSessionMap::new(),
+            pkt_count: 0,
+            dbg_rtp_count: AtomicU64::new(0),
+            metrics: ServerMetrics::new(),
+            admin_tx,
+            spawn_rtp_relayed:  Arc::new(AtomicU64::new(0)),
+            spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
+            spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
+            worker_id,
+        }
+    }
+
+    pub async fn run(mut self) {
+        let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
+        let is_primary = self.worker_id == 0;
+
+        info!("[W{}] UDP worker started", self.worker_id);
+
+        // 타이머는 worker-0만 실행 (metrics flush, REMB 전송)
+        let mut metrics_timer = tokio::time::interval(
+            tokio::time::Duration::from_secs(3),
+        );
+        metrics_timer.tick().await;
+
+        let mut remb_timer = tokio::time::interval(
+            tokio::time::Duration::from_millis(config::REMB_INTERVAL_MS),
+        );
+        remb_timer.tick().await;
+
+        loop {
+            tokio::select! {
+                result = self.socket.recv_from(&mut buf) => {
+                    let (len, remote) = match result {
+                        Ok(r) => r,
+                        Err(e) => { error!("[W{}] UDP recv error: {e}", self.worker_id); continue; }
+                    };
+
+                    let data = Bytes::copy_from_slice(&buf[..len]);
+
+                    match demux::classify(&data) {
+                        PacketType::Stun => self.handle_stun(&data, remote).await,
+                        PacketType::Dtls => self.handle_dtls(data, remote).await,
+                        PacketType::Srtp => self.handle_srtp(&data, remote).await,
+                        PacketType::Unknown => {
+                            trace!("unknown packet from {} byte0=0x{:02X}", remote, data[0]);
+                        }
+                    }
+
+                    self.pkt_count += 1;
+                    if self.pkt_count % 1000 == 0 {
+                        self.dtls_map.remove_stale();
+                    }
+                }
+                _ = metrics_timer.tick(), if is_primary => {
+                    self.flush_metrics();
+                }
+                _ = remb_timer.tick(), if is_primary => {
+                    self.send_remb_to_publishers().await;
+                }
+            }
+        }
+    }
+
+    /// 3초마다 metrics 집계 → admin_tx로 push → reset
+    fn flush_metrics(&mut self) {
+        let mut json = self.metrics.to_json();
+        // Phase W-1: spawn fan-out atomic counters 포함
+        let rtp_relayed = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
+        let sr_relayed  = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
+        let enc_fail    = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
+        if let serde_json::Value::Object(ref mut map) = json {
+            map.insert("spawn_rtp_relayed".into(), serde_json::json!(rtp_relayed));
+            map.insert("spawn_sr_relayed".into(), serde_json::json!(sr_relayed));
+            map.insert("spawn_encrypt_fail".into(), serde_json::json!(enc_fail));
+        }
+        let _ = self.admin_tx.send(json.to_string());
+        self.metrics.reset();
+    }
+
+    // ========================================================================
+    // STUN — cold path (ICE connectivity check)
+    // ========================================================================
+
+    async fn handle_stun(&mut self, buf: &[u8], remote: SocketAddr) {
+        let msg = match stun::parse(buf) {
+            Some(m) => m,
+            None => { trace!("STUN parse failed from {}", remote); return; }
+        };
+
+        if msg.msg_type != stun::BINDING_REQUEST {
+            trace!("non-binding STUN from {} type=0x{:04X}", remote, msg.msg_type);
+            return;
+        }
+
+        let username = match msg.username() {
+            Some(u) => u,
+            None => { debug!("STUN without USERNAME from {}", remote); return; }
+        };
+        let server_ufrag = match username.split(':').next() {
+            Some(s) => s,
+            None => { debug!("invalid STUN USERNAME format: {}", username); return; }
+        };
+
+        // Latch → returns (Participant, PcType, Room)
+        let (participant, pc_type, _room) = match self.room_hub.latch_by_ufrag(server_ufrag, remote) {
+            Some(r) => r,
+            None => { debug!("unknown ufrag={} from {}", server_ufrag, remote); return; }
+        };
+
+        participant.touch(current_ts());
+
+        let session = participant.session(pc_type);
+
+        info!("[DBG:STUN] latch user={} pc={} ufrag={} addr={}",
+            participant.user_id, pc_type, server_ufrag, remote);
+
+        // Verify MESSAGE-INTEGRITY with the session's ice_pwd
+        let integrity_key = stun::ice_integrity_key(&session.ice_pwd);
+        if !stun::verify_message_integrity(&msg, &integrity_key) {
+            warn!("[DBG:STUN] MESSAGE-INTEGRITY mismatch user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
+            return;
+        }
+
+        let response = stun::build_binding_response(
+            &msg.transaction_id,
+            remote,
+            &integrity_key,
+        );
+        if let Err(e) = self.socket.send_to(&response, remote).await {
+            error!("STUN response send failed: {e}");
+        }
+        info!("[DBG:STUN] binding-response sent user={} pc={} addr={}",
+            participant.user_id, pc_type, remote);
+
+        // USE-CANDIDATE → trigger DTLS handshake for this PC session
+        if msg.has_use_candidate() && !self.dtls_map.has(&remote) {
+            info!("[DBG:STUN] USE-CANDIDATE user={} pc={} addr={} → starting DTLS",
+                participant.user_id, pc_type, remote);
+            self.start_dtls_handshake(remote, participant, pc_type).await;
+        }
+    }
+
+    // ========================================================================
+    // DTLS — handshake path (per PC session)
+    // ========================================================================
+
+    async fn handle_dtls(&mut self, data: Bytes, remote: SocketAddr) {
+        if self.dtls_map.inject(&remote, data.clone()).await {
+            return;
+        }
+
+        let (participant, pc_type, _room) = match self.room_hub.find_by_addr(&remote) {
+            Some(r) => r,
+            None => {
+                info!("[DBG:DTLS] from unlatched addr={}, dropping", remote);
+                return;
+            }
+        };
+
+        info!("[DBG:DTLS] new session user={} pc={} addr={} pkt_len={}",
+            participant.user_id, pc_type, remote, data.len());
+        self.start_dtls_handshake(remote, participant, pc_type).await;
+        self.dtls_map.inject(&remote, data).await;
+    }
+
+    async fn start_dtls_handshake(
+        &mut self,
+        remote: SocketAddr,
+        participant: Arc<crate::room::participant::Participant>,
+        pc_type: PcType,
+    ) {
+        let (adapter, tx) = DemuxConn::new(Arc::clone(&self.socket), remote);
+        self.dtls_map.insert(remote, tx);
+
+        let cert = Arc::clone(&self.cert);
+        let socket = Arc::clone(&self.socket);
+        let room_hub = Arc::clone(&self.room_hub);
+
+        tokio::spawn(async move {
+            info!("[DBG:DTLS] handshake starting user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
+            let config = dtls::server_config(&cert);
+            let conn: Arc<dyn webrtc_util::conn::Conn + Send + Sync> = Arc::new(adapter);
+
+            let timeout = tokio::time::Duration::from_secs(10);
+            let result = tokio::time::timeout(timeout, dtls::accept_dtls(conn, config)).await;
+
+            match result {
+                Ok(Ok(dtls_conn)) => {
+                    info!("[DBG:DTLS] handshake OK user={} pc={} addr={}",
+                        participant.user_id, pc_type, remote);
+                    match dtls::export_srtp_keys(&dtls_conn).await {
+                        Ok(keys) => {
+                            // Install SRTP keys on the specific session (publish or subscribe)
+                            let session = participant.session(pc_type);
+                            session.install_srtp_keys(
+                                &keys.client_key,
+                                &keys.client_salt,
+                                &keys.server_key,
+                                &keys.server_salt,
+                            );
+                            info!("[DBG:DTLS] SRTP ready user={} pc={} addr={}",
+                                participant.user_id, pc_type, remote);
+
+                            // Subscribe SRTP ready → egress task spawn + PLI
+                            if pc_type == PcType::Subscribe {
+                                // Phase W-3: subscriber별 egress task spawn
+                                let egress_rx = participant.egress_rx.lock().unwrap().take();
+                                if let Some(rx) = egress_rx {
+                                    let eg_socket = Arc::clone(&socket);
+                                    let eg_participant = Arc::clone(&participant);
+                                    tokio::spawn(run_egress_task(rx, eg_participant, eg_socket));
+                                    info!("[EGRESS] spawned user={}", participant.user_id);
+                                }
+
+                                if let Ok(room) = room_hub.get(&participant.room_id) {
+                                    info!("[DBG:PLI] subscribe ready, requesting keyframes user={}",
+                                        participant.user_id);
+                                    send_pli_to_publishers(&socket, &room, &participant.user_id).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("[DBG:DTLS] SRTP key export FAILED user={} pc={}: {e}",
+                                participant.user_id, pc_type);
+                        }
+                    }
+
+                    // Keep DTLSConn alive
+                    let mut keepalive_buf = vec![0u8; 1500];
+                    loop {
+                        match dtls_conn.recv(&mut keepalive_buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("[DBG:DTLS] handshake FAILED user={} pc={}: {e}",
+                        participant.user_id, pc_type);
+                }
+                Err(_) => {
+                    warn!("[DBG:DTLS] handshake TIMEOUT (10s) user={} pc={} addr={}",
+                        participant.user_id, pc_type, remote);
+                }
+            }
+
+            trace!("[DBG:DTLS] session ended user={} pc={} addr={}",
+                participant.user_id, pc_type, remote);
+        });
+    }
+}
+
+// ============================================================================
+// Phase W-2: SO_REUSEPORT multi-worker support (Linux only)
+// ============================================================================
+
+/// UDP worker 수 결정 (0 = auto = 코어 수)
+pub fn resolve_worker_count(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// SO_REUSEPORT로 UDP 소켓 바인드 (Linux 전용)
+/// 동일 포트에 N개 소켓을 바인드하면 커널이 4-tuple hash로 패킷 분배
+#[cfg(target_os = "linux")]
+pub fn bind_reuseport(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    let addr: socket2::SockAddr = SocketAddr::from(([0, 0, 0, 0], port)).into();
+    socket.bind(&addr)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
+}
