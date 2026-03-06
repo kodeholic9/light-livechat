@@ -3,7 +3,8 @@ name = "light-livechat"
 version = "0.3.4"
 edition = "2024"
 description = "High-performance SFU server — 2PC / SDP-free architecture"
-authors = ["kodeholic (powered by Claude)"]
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+license = "Apache-2.0"
 
 [[bin]]
 name = "livechatd"
