@@ -138,7 +138,8 @@
 - [x] sfu-bench v0.1.0 완성 (insight-lens/livechat-bench) — publisher 1 + subscriber N 자동화
 - [x] RPi 4B fan-out 한계 테스트 (fo1→499, 13회, loss 0.002%, CPU 69%)
 - [x] 벤치마크 리포트 문서화 (doc/BENCHMARK-FANOUT-20260306.md)
-- [ ] Multi-publisher 벤치마크 (5×5, 10×10 회의실 시나리오)
+- [x] Conference 벤치마크 (5/10/20/25/30인, 25인 PASS, 30인 FAIL)
+- [ ] Multi-publisher 확장 벤치마크 (40인+ — fan-out 루프 병렬화 후)
 - [ ] TWCC 구현 후 전후 벤치마크 비교
 
 ## Backlog
