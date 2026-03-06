@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.7] - 2026-03-07
+
+### Added (Phase W-3: Subscriber Egress Task — LiveKit 패턴)
+
+#### 서버
+- `EgressPacket` enum (Rtp/Rtcp) + `Participant.egress_tx/rx` bounded channel
+- `run_egress_task()` — subscriber별 전용 task, `outbound_srtp` 독점 encrypt
+- subscribe DTLS ready 시 egress task 자동 spawn
+- `handle_srtp` fan-out: spawn+Mutex → `egress_tx.try_send` (~50ns, lock 없음)
+- `relay_publish_rtcp`: spawn+Mutex → `egress_tx.try_send` + async→fn
+- `handle_nack_block` RTX: direct encrypt → `egress_tx.try_send` + async→fn
+- `config.rs`: `EGRESS_QUEUE_SIZE=256` (bounded backpressure)
+
+### 결과 (RPi 4B 벤치마크)
+- 30인: loss **0.000%**, CPU 138%, latency **15ms** — 프로덕션 품질
+- 35인: loss **7.0%** (W-2: 17.8%), latency 152ms — 2.5배 개선
+- 40인: loss 22.8%, CPU 201% — RPi 4B 물리적 한계
+
+### 설계 결정
+- Mutex 경합 원천 제거: subscriber별 egress task가 outbound_srtp 독점
+- bounded channel backpressure: 큐 풀 시 try_send 실패 = 드롭 (NACK/RTX 커버)
+- egress_rx는 Mutex<Option>>로 1회용 .take() — 재 spawn 방지
+- RPi 4B 실용 한계: 30~35인 (x86 서버로는 100인+ 가능한 구조)
+
 ## [0.3.6] - 2026-03-07
 
 ### Added (Phase W-2: SO_REUSEPORT multi-worker — UDP 멀티코어 분산 2단계)

@@ -206,6 +206,7 @@ async-trait = "0.1"
 | BM | Fan-out Benchmark (RPi 499sub, loss 0.002%) | 0.3.4 | ✅ |
 | W-1 | Fan-out spawn (tokio::spawn 분리, 30인 PASS) | 0.3.5 | ✅ |
 | W-2 | Multi-worker (SO_REUSEPORT, 30인 0.1%) | 0.3.6 | ✅ |
+| W-3 | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms) | 0.3.7 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
