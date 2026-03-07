@@ -42,6 +42,7 @@ use tracing::{debug, error, info, trace, warn};
 use webrtc_util::conn::Conn;
 
 use crate::config;
+use crate::config::BweMode;
 use crate::room::participant::PcType;
 use crate::room::room::RoomHub;
 use crate::transport::demux::{self, PacketType};
@@ -113,6 +114,10 @@ pub struct UdpTransport {
     pub(crate) spawn_encrypt_fail: Arc<AtomicU64>,
     // Phase W-2: multi-worker
     pub(crate) worker_id: u8,
+    // BWE mode (TWCC or REMB)
+    pub(crate) bwe_mode: BweMode,
+    // REMB bitrate (bps, .env REMB_BITRATE_BPS)
+    pub(crate) remb_bitrate: u64,
 }
 
 impl UdpTransport {
@@ -138,6 +143,8 @@ impl UdpTransport {
             spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
             spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
             worker_id: 0,
+            bwe_mode: BweMode::Twcc,
+            remb_bitrate: config::REMB_BITRATE_BPS,
         })
     }
 
@@ -148,7 +155,7 @@ impl UdpTransport {
         cert:     Arc<ServerCert>,
         admin_tx: broadcast::Sender<String>,
     ) -> Self {
-        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0)
+        Self::from_socket_with_id(socket, room_hub, cert, admin_tx, 0, BweMode::Twcc, config::REMB_BITRATE_BPS)
     }
 
     /// Phase W-2: worker_id 지정 생성자
@@ -158,6 +165,8 @@ impl UdpTransport {
         cert:     Arc<ServerCert>,
         admin_tx: broadcast::Sender<String>,
         worker_id: u8,
+        bwe_mode: BweMode,
+        remb_bitrate: u64,
     ) -> Self {
         Self {
             socket,
@@ -172,6 +181,8 @@ impl UdpTransport {
             spawn_sr_relayed:   Arc::new(AtomicU64::new(0)),
             spawn_encrypt_fail: Arc::new(AtomicU64::new(0)),
             worker_id,
+            bwe_mode,
+            remb_bitrate,
         }
     }
 
@@ -179,7 +190,7 @@ impl UdpTransport {
         let mut buf = BytesMut::zeroed(config::UDP_RECV_BUF_SIZE);
         let is_primary = self.worker_id == 0;
 
-        info!("[W{}] UDP worker started", self.worker_id);
+        info!("[W{}] UDP worker started (bwe={})", self.worker_id, self.bwe_mode);
 
         // 타이머는 worker-0만 실행 (metrics flush, REMB 전송)
         let mut metrics_timer = tokio::time::interval(
@@ -187,10 +198,15 @@ impl UdpTransport {
         );
         metrics_timer.tick().await;
 
-        let mut twcc_timer = tokio::time::interval(
-            tokio::time::Duration::from_millis(config::TWCC_FEEDBACK_INTERVAL_MS),
+        // BWE 모드에 따라 타이머 주기 결정: TWCC=100ms, REMB=1000ms
+        let bwe_interval = match self.bwe_mode {
+            BweMode::Twcc => config::TWCC_FEEDBACK_INTERVAL_MS,
+            BweMode::Remb => config::REMB_INTERVAL_MS,
+        };
+        let mut bwe_timer = tokio::time::interval(
+            tokio::time::Duration::from_millis(bwe_interval),
         );
-        twcc_timer.tick().await;
+        bwe_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -219,8 +235,11 @@ impl UdpTransport {
                 _ = metrics_timer.tick(), if is_primary => {
                     self.flush_metrics();
                 }
-                _ = twcc_timer.tick(), if is_primary => {
-                    self.send_twcc_to_publishers().await;
+                _ = bwe_timer.tick(), if is_primary => {
+                    match self.bwe_mode {
+                        BweMode::Twcc => self.send_twcc_to_publishers().await,
+                        BweMode::Remb => self.send_remb_to_publishers().await,
+                    }
                 }
             }
         }

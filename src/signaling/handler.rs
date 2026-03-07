@@ -363,7 +363,7 @@ async fn handle_room_join(session: &mut Session, state: &AppState, packet: &Pack
                 "setup": "passive",
             },
             "codecs": server_codec_policy(),
-            "extmap": server_extmap_policy(),
+            "extmap": server_extmap_policy(state.bwe_mode),
         },
         "tracks": existing_tracks,
     }))
@@ -712,16 +712,19 @@ fn server_codec_policy() -> serde_json::Value {
     ])
 }
 
-fn server_extmap_policy() -> serde_json::Value {
-    // Phase TW-3: transport-wide-cc (id=6) 활성화
-    // Chrome BWE가 TWCC 모드로 전환, 서버가 100ms 주기로 feedback 생성.
-    // REMB는 더 이상 사용하지 않음 (Chrome이 TWCC 선언 시 REMB 무시).
-    serde_json::json!([
-        { "id": 1, "uri": "urn:ietf:params:rtp-hdrext:sdes:mid" },
-        { "id": 4, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level" },
-        { "id": 5, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" },
-        { "id": 6, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" }
-    ])
+fn server_extmap_policy(bwe_mode: config::BweMode) -> serde_json::Value {
+    // BWE 모드에 따라 transport-wide-cc extmap 포함 여부 결정
+    // TWCC: extmap id=6 포함 → Chrome GCC delay gradient 기반 적응적 BWE
+    // REMB: extmap id=6 제외 → Chrome REMB 모드, 서버 고정 REMB 힌트
+    let mut exts = vec![
+        serde_json::json!({ "id": 1, "uri": "urn:ietf:params:rtp-hdrext:sdes:mid" }),
+        serde_json::json!({ "id": 4, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level" }),
+        serde_json::json!({ "id": 5, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time" }),
+    ];
+    if bwe_mode == config::BweMode::Twcc {
+        exts.push(serde_json::json!({ "id": 6, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01" }));
+    }
+    serde_json::Value::Array(exts)
 }
 
 // ============================================================================

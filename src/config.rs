@@ -79,7 +79,42 @@ pub const RTCP_FMT_REMB: u8 = 15;
 /// 서버 자체 REMB 전송 주기 (ms) — publisher에게 대역폭 힘트 제공
 pub const REMB_INTERVAL_MS: u64 = 1_000;
 /// 서버 REMB 권장 비트레이트 (bps) — Chrome BWE의 상한 힌트
+/// .env `REMB_BITRATE_BPS=500000` 으로 오버라이드 가능
 pub const REMB_BITRATE_BPS: u64 = 500_000;
+
+/// .env REMB_BITRATE_BPS 파싱 (기본 500kbps)
+pub fn resolve_remb_bitrate() -> u64 {
+    std::env::var("REMB_BITRATE_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REMB_BITRATE_BPS)
+}
+
+// --- BWE (Bandwidth Estimation) Mode ---
+/// 대역폭 추정 모드: TWCC(적응적) 또는 REMB(고정 힌트)
+/// .env `BWE_MODE=twcc` 또는 `BWE_MODE=remb` (기본: twcc)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BweMode {
+    Twcc,
+    Remb,
+}
+
+impl std::fmt::Display for BweMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BweMode::Twcc => write!(f, "twcc"),
+            BweMode::Remb => write!(f, "remb"),
+        }
+    }
+}
+
+/// .env BWE_MODE 파싱 (기본 twcc)
+pub fn resolve_bwe_mode() -> BweMode {
+    match std::env::var("BWE_MODE").unwrap_or_default().to_lowercase().as_str() {
+        "remb" => BweMode::Remb,
+        _ => BweMode::Twcc,
+    }
+}
 
 // --- TWCC (Transport-Wide Congestion Control) ---
 /// TWCC RTP header extension ID (서버 extmap 정책과 일치해야 함)

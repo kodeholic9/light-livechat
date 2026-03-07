@@ -24,6 +24,7 @@
 //!   recv_delta(s) — small(1byte, unsigned, ×250µs) or large(2bytes, signed, ×250µs)
 
 use std::time::Instant;
+use tracing::debug;
 
 use crate::config;
 
@@ -355,6 +356,33 @@ pub fn build_twcc_feedback(
     let reference_time_24 = (reference_time_raw as i32) & 0x00FF_FFFF;
 
     // ================================================================
+    // 진단 로그 — feedback 패킷 핵심 파라미터
+    // ================================================================
+    {
+        let received = statuses.iter().filter(|s| **s != PacketStatus::NotReceived).count();
+        let lost = statuses.iter().filter(|s| **s == PacketStatus::NotReceived).count();
+        let small = statuses.iter().filter(|s| **s == PacketStatus::SmallDelta).count();
+        let large = statuses.iter().filter(|s| **s == PacketStatus::LargeDelta).count();
+        let (d_min, d_max, d_first) = if deltas.is_empty() {
+            (0i64, 0i64, 0i64)
+        } else {
+            (*deltas.iter().min().unwrap(), *deltas.iter().max().unwrap(), deltas[0])
+        };
+        let neg_count = deltas.iter().filter(|d| **d < 0).count();
+
+        debug!(
+            "[TWCC:FB] ssrc=0x{:08X} fb#{} base_seq={} count={} recv={} lost={} \
+             small={} large={} neg={} delta_first={} delta_min={} delta_max={} \
+             ref_time={} (raw={}) base_elapsed_ms={}",
+            media_ssrc, recorder.fb_pkt_count, base_seq, pkt_status_count,
+            received, lost, small, large, neg_count,
+            d_first, d_min, d_max,
+            reference_time_24, reference_time_raw,
+            first_offset_us / 1000,
+        );
+    }
+
+    // ================================================================
     // 3단계: Packet chunk 인코딩 (2-bit status vector, 7 symbols/chunk)
     // ================================================================
 
@@ -435,6 +463,9 @@ pub fn build_twcc_feedback(
 
     // pending_base 전진 (다음 feedback은 여기서부터)
     recorder.advance_base(base_seq.wrapping_add(pkt_status_count));
+
+    debug!("[TWCC:FB] pkt_size={} chunks={} delta_bytes={}",
+        buf.len(), chunks.len(), delta_bytes.len());
 
     Some(buf)
 }

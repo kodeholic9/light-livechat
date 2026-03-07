@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 
+use crate::config::BweMode;
 use crate::room::room::RoomHub;
 use crate::transport::dtls::ServerCert;
 
@@ -26,6 +27,10 @@ pub struct AppState {
     pub ws_port:    u16,
     /// UDP 미디어 포트
     pub udp_port:   u16,
+    /// BWE 모드 (TWCC or REMB, .env BWE_MODE)
+    pub bwe_mode:   BweMode,
+    /// REMB 비트레이트 (bps, .env REMB_BITRATE_BPS)
+    pub remb_bitrate: u64,
 }
 
 impl AppState {
@@ -35,6 +40,8 @@ impl AppState {
         public_ip: String,
         ws_port: u16,
         udp_port: u16,
+        bwe_mode: BweMode,
+        remb_bitrate: u64,
     ) -> Self {
         let (admin_tx, _) = broadcast::channel(ADMIN_CHANNEL_SIZE);
         Self {
@@ -45,6 +52,8 @@ impl AppState {
             public_ip,
             ws_port,
             udp_port,
+            bwe_mode,
+            remb_bitrate,
         }
     }
 }

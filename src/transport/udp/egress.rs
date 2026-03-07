@@ -1,7 +1,8 @@
 // author: kodeholic (powered by Claude)
 //! Egress — subscriber 방향 패킷 송신 처리
 //!
-//! - send_twcc_to_publishers: TWCC feedback → publisher (100ms 주기)
+//! - send_twcc_to_publishers: TWCC feedback → publisher (BWE_MODE=twcc, 100ms)
+//! - send_remb_to_publishers: REMB 힌트 → publisher (BWE_MODE=remb, 1초)
 //! - run_egress_task: subscriber별 전용 egress (큐 → encrypt → send)
 //! - send_pli_to_publishers: subscribe ready → PLI 요청
 
@@ -13,11 +14,11 @@ use tracing::{debug, info, warn};
 use crate::room::participant::{EgressPacket, TrackKind};
 
 use super::UdpTransport;
-use super::rtcp::build_pli;
+use super::rtcp::{build_pli, build_remb};
 use super::twcc::build_twcc_feedback;
 
 // ============================================================================
-// UdpTransport impl — TWCC feedback 전송 (timer-driven)
+// UdpTransport impl — BWE feedback 전송 (TWCC 100ms / REMB 1초)
 // ============================================================================
 
 impl UdpTransport {
@@ -73,6 +74,50 @@ impl UdpTransport {
                     debug!("[TWCC] send FAILED user={} addr={}: {e}", publisher.user_id, pub_addr);
                 } else {
                     self.metrics.twcc_sent += 1;
+                }
+            }
+        }
+    }
+
+    /// 모든 room의 모든 publisher에게 REMB 전송 (BWE_MODE=remb 시 사용)
+    /// Chrome BWE에게 "이 만큼까지 보내도 된다"는 고정 대역폭 힌트 제공
+    pub(crate) async fn send_remb_to_publishers(&mut self) {
+        for room_entry in self.room_hub.rooms.iter() {
+            let room = room_entry.value();
+
+            for entry in room.participants.iter() {
+                let publisher = entry.value();
+                if !publisher.is_publish_ready() { continue; }
+
+                let pub_addr = match publisher.publish.get_address() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let video_ssrc = {
+                    let tracks = publisher.tracks.lock().unwrap();
+                    tracks.iter()
+                        .find(|t| t.kind == TrackKind::Video)
+                        .map(|t| t.ssrc)
+                };
+
+                let ssrc = match video_ssrc {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let remb_plain = build_remb(self.remb_bitrate, ssrc);
+
+                let encrypted = {
+                    let mut ctx = publisher.publish.outbound_srtp.lock().unwrap();
+                    match ctx.encrypt_rtcp(&remb_plain) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    }
+                };
+
+                if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
+                    debug!("[REMB] send FAILED user={} addr={}: {e}", publisher.user_id, pub_addr);
                 }
             }
         }

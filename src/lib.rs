@@ -54,6 +54,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let _udp_workers: usize = env_or("UDP_WORKER_COUNT", config::UDP_WORKER_COUNT);
     let public_ip: String = std::env::var("PUBLIC_IP")
         .unwrap_or_else(|_| detect_local_ip());
+    let bwe_mode = config::resolve_bwe_mode();
+    let remb_bitrate = config::resolve_remb_bitrate();
     let log_dir: Option<String> = std::env::var("LOG_DIR").ok()
         .filter(|d| !d.is_empty() && std::path::Path::new(d).is_dir());
     let log_level: String = std::env::var("LOG_LEVEL")
@@ -91,8 +93,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    info!("config: PUBLIC_IP={} WS_PORT={} UDP_PORT={} LOG_DIR={}",
-        public_ip, ws_port, udp_port, log_dir.as_deref().unwrap_or("(stdout)"));
+    info!("config: PUBLIC_IP={} WS_PORT={} UDP_PORT={} BWE_MODE={} REMB_BPS={} LOG_DIR={}",
+        public_ip, ws_port, udp_port, bwe_mode, remb_bitrate, log_dir.as_deref().unwrap_or("(stdout)"));
 
     // Generate DTLS server certificate (once per instance)
     let cert = ServerCert::generate()?;
@@ -121,7 +123,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build shared state (primary_socket을 AppState에 공유 — PLI/REMB 전송용)
-    let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port);
+    let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port, bwe_mode, remb_bitrate);
 
     // Create default rooms
     create_default_rooms(&state);
@@ -136,6 +138,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&state.cert),
         state.admin_tx.clone(),
         0,
+        bwe_mode,
+        remb_bitrate,
     );
     tokio::spawn(async move { w0.run().await; });
 
@@ -151,6 +155,8 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&state.cert),
                 state.admin_tx.clone(),
                 i as u8,
+                bwe_mode,
+                remb_bitrate,
             );
             tokio::spawn(async move { w.run().await; });
         }
