@@ -128,11 +128,18 @@
 - [x] Structured logging (info/debug/trace 레벨 정리) — v0.2.1
 
 ## Phase E: PTT Support
-- [ ] Room mode field (Conference / PTT)
-- [ ] Floor control state machine (Idle → Taken → Idle)
-- [ ] FLOOR_REQUEST / FLOOR_RELEASE opcodes
-- [ ] Relay gate: only floor holder's media forwarded in PTT mode
-- [ ] Floor indicator broadcast
+- [x] Room mode field (Conference / PTT) — v0.5.0
+- [x] Floor control state machine (Idle → Taken → Idle) — v0.5.0
+- [x] FLOOR_REQUEST / FLOOR_RELEASE / FLOOR_PING opcodes — v0.5.0
+- [x] Floor indicator broadcast (FLOOR_TAKEN/FLOOR_IDLE/FLOOR_REVOKE) — v0.5.0
+- [x] E-0: Floor Timer Task (2초 주기, T2/PING 타임아웃 revoke) — v0.5.1
+- [x] E-1: Relay Gate (handle_srtp + relay_publish_rtcp PTT 게이팅) — v0.5.1
+- [x] E-2: Audio SSRC Rewriting (PttRewriter, Opus PT=111, 오프셋 연산) — v0.5.1
+- [x] E-4: Video SSRC Rewriting (VP8 PT=96, 키프레임 대기, is_vp8_keyframe) — v0.5.1
+- [x] E-4: NACK 역매핑 (가상seq→원본seq, RtpCache 조회) — v0.5.1
+- [x] E-4: Subscribe RTCP relay 가상SSRC→원본SSRC 변환 — v0.5.1
+- [x] PTT 메트릭 7개 카운터 + 어드민 PTT 상태 스냅샷 — v0.5.1
+- [ ] E-5: 클라이언트 SDK PTT 지원 (Floor UI + 에스컬레이션 면트 연동)
 
 ## Phase W: UDP Worker 멀티코어 분산
 - [x] W-1: Fan-out spawn — handle_srtp/relay_publish_rtcp fan-out을 tokio::spawn 분리 — v0.3.5

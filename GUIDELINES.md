@@ -133,7 +133,9 @@ src/
 │   └── track.rs            Track context
 └── room/
     ├── room.rs             Room (3-index) + RoomHub (reverse indices)
-    └── participant.rs      Participant (ICE + SRTP + tracks)
+    ├── participant.rs      Participant (ICE + SRTP + tracks)
+    ├── floor.rs            FloorController (PTT 발화권 상태 머신)
+    └── ptt_rewriter.rs     PttRewriter (SSRC/seq/ts 리라이팅 + VP8 키프레임 감지)
 ```
 
 ---
@@ -219,7 +221,8 @@ async-trait = "0.1"
 | TV | Telemetry Visibility (환경메타 + Egress timing + Tokio RuntimeMetrics) | 0.3.9 | ✅ |
 | HP | Hot Path Vec alloc 제거 + egress_drop 방어 | 0.3.10 | ✅ |
 | GM | GlobalMetrics 리팩터링 (Arc + 전체 Atomic, &mut self 제거) + 모듈 분리 | 0.4.0 | ✅ |
-| E | PTT 지원 | 0.4.x | |
+| E-0~4 | PTT 미디어 파이프라인 (게이팅+리라이팅+키프레임+NACK역매핑+메트릭) | 0.5.1 | ✅ |
+| E-5 | 클라이언트 SDK PTT 지원 | 0.5.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
 ---
@@ -293,6 +296,14 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.5.1 — PTT 미디어 파이프라인 (Phase E-0~E-4)
+- E-0: Floor Timer Task (2초 주기, T2/PING 타임아웃 revoke)
+- E-1: Relay Gate (미디어 게이팅 — floor holder만 RTP 통과)
+- E-2: Audio SSRC Rewriting (PttRewriter, Opus 오프셋 연산, marker bit)
+- E-4: Video SSRC Rewriting (VP8 키프레임 대기, is_vp8_keyframe, NACK 역매핑)
+- PTT 메트릭 7개 카운터 + 어드민 PTT 상태 스냅샷
+- AppState에 Arc<GlobalMetrics> 추가 (handler에서 메트릭 접근)
 
 ### v0.4.0 — GlobalMetrics 리팩터링 + 모듈 분리 (Phase GM)
 - `ServerMetrics` → `GlobalMetrics` (Arc 공유, 전체 Atomic) — &mut self 감염 제거

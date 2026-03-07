@@ -124,17 +124,17 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Phase GM: 전역 메트릭 (모든 worker + egress task + handler 공유)
+    let metrics = Arc::new(GlobalMetrics::new(worker_count, &bwe_mode));
+
     // Build shared state (primary_socket을 AppState에 공유 — PLI/REMB 전송용)
-    let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port, bwe_mode, remb_bitrate);
+    let state = AppState::new(cert, Arc::clone(&primary_socket), public_ip, ws_port, udp_port, bwe_mode, remb_bitrate, Arc::clone(&metrics));
 
     // Create default rooms
     create_default_rooms(&state);
 
     // Cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
-
-    // Phase GM: 전역 메트릭 (모든 worker + egress task 공유)
-    let metrics = Arc::new(GlobalMetrics::new(worker_count, &bwe_mode));
 
     // Worker-0: primary socket 사용
     let w0 = UdpTransport::from_socket_with_id(
@@ -174,6 +174,14 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let reaper_rooms = Arc::clone(&state.rooms);
     tokio::spawn(async move {
         run_zombie_reaper(reaper_rooms, reaper_cancel).await;
+    });
+
+    // Start floor timer (PTT T2/T_FLOOR_TIMEOUT 감시)
+    let floor_cancel = cancel.clone();
+    let floor_rooms = Arc::clone(&state.rooms);
+    let floor_metrics = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        run_floor_timer(floor_rooms, floor_metrics, floor_cancel).await;
     });
 
     // Start WebSocket signaling
@@ -298,6 +306,83 @@ fn create_default_rooms(state: &AppState) {
     for (name, capacity, mode) in defaults {
         let room = state.rooms.create(name.to_string(), Some(capacity), mode, now);
         info!("default room created: {} (id={}, cap={}, mode={})", name, room.id, capacity, room.mode);
+    }
+}
+
+/// Floor Control 타이머 태스크 (PTT T2/T_FLOOR_TIMEOUT 감시)
+/// 2초 주기로 PTT 모드 room의 floor 타이머를 체크하여
+/// max burst 초과 또는 ping 미수신 시 발화권을 강제 회수한다.
+async fn run_floor_timer(
+    rooms: Arc<crate::room::room::RoomHub>,
+    metrics: Arc<crate::metrics::GlobalMetrics>,
+    cancel: CancellationToken,
+) {
+    let mut timer = tokio::time::interval(
+        tokio::time::Duration::from_millis(config::FLOOR_PING_INTERVAL_MS),
+    );
+    timer.tick().await; // 첫 tick 즉시 소비
+
+    loop {
+        tokio::select! {
+            _ = timer.tick() => {}
+            _ = cancel.cancelled() => {
+                info!("floor timer stopped (shutdown)");
+                return;
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // PTT 모드 room만 순회
+        for entry in rooms.rooms.iter() {
+            let room = entry.value();
+            if room.mode != config::RoomMode::Ptt {
+                continue;
+            }
+
+            if let Some(action) = room.floor.check_timers(now) {
+                match &action {
+                    crate::room::floor::FloorAction::Revoked { prev_speaker, cause } => {
+                        metrics.ptt_floor_revoked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!("[FLOOR] timer revoke: user={} cause={} room={}",
+                            prev_speaker, cause, room.id);
+
+                        // rewriter 정리
+                        room.audio_rewriter.clear_speaker();
+                        room.video_rewriter.clear_speaker();
+
+                        // 발화자에게 FLOOR_REVOKE
+                        if let Some(p) = room.get_participant(prev_speaker) {
+                            let revoke = Packet::new(
+                                opcode::FLOOR_REVOKE,
+                                0,
+                                serde_json::json!({
+                                    "room_id": &room.id,
+                                    "cause": cause,
+                                }),
+                            );
+                            let json = serde_json::to_string(&revoke).unwrap_or_default();
+                            let _ = p.ws_tx.send(json);
+                        }
+
+                        // 전체에 FLOOR_IDLE
+                        let idle = Packet::new(
+                            opcode::FLOOR_IDLE,
+                            0,
+                            serde_json::json!({
+                                "room_id": &room.id,
+                                "prev_speaker": prev_speaker,
+                            }),
+                        );
+                        broadcast_to_room_all(&room, &idle);
+                    }
+                    _ => {} // check_timers는 Revoked만 반환
+                }
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@ use std::time::Instant;
 use tracing::{debug, trace};
 
 use crate::config;
+use crate::config::RoomMode;
 use crate::room::participant::{PcType, EgressPacket};
 use crate::room::room::Room;
 
@@ -148,6 +149,57 @@ impl UdpTransport {
                 rtp_hdr.ssrc, rtp_hdr.pt, rtp_hdr.seq);
         }
 
+        // Phase E-1: PTT 모드 미디어 게이팅 — floor holder만 통과
+        if room.mode == RoomMode::Ptt {
+            let allowed = match room.floor.current_speaker() {
+                Some(ref speaker) if speaker == &sender.user_id => true,
+                _ => false,
+            };
+            if !allowed {
+                self.metrics.ptt_rtp_gated.fetch_add(1, Ordering::Relaxed);
+                if is_detail {
+                    trace!("[DBG:PTT] RTP dropped user={} (not floor holder)", sender.user_id);
+                }
+                return;
+            }
+        }
+
+        // Phase E-2/E-4: PTT 모드 SSRC 리라이팅 (오디오 + 비디오)
+        let fanout_payload = if room.mode == RoomMode::Ptt {
+            use crate::room::ptt_rewriter::{RewriteResult, is_vp8_keyframe};
+            let mut rewritten = plaintext.clone();
+            let result = if rtp_hdr.pt == 111 {
+                // Audio (Opus) — 키프레임 대기 없음
+                room.audio_rewriter.rewrite(&mut rewritten, &sender.user_id, false)
+            } else if rtp_hdr.pt == 96 {
+                // Video (VP8) — 키프레임 감지 후 리라이팅
+                let keyframe = is_vp8_keyframe(&plaintext);
+                if keyframe {
+                    self.metrics.ptt_keyframe_arrived.fetch_add(1, Ordering::Relaxed);
+                }
+                room.video_rewriter.rewrite(&mut rewritten, &sender.user_id, keyframe)
+            } else {
+                RewriteResult::Skip
+            };
+            match result {
+                RewriteResult::Ok => {
+                    self.metrics.ptt_rtp_rewritten.fetch_add(1, Ordering::Relaxed);
+                    rewritten
+                }
+                RewriteResult::PendingKeyframe => {
+                    self.metrics.ptt_video_pending_drop.fetch_add(1, Ordering::Relaxed);
+                    if is_detail {
+                        trace!("[DBG:PTT] video dropped (pending keyframe) user={} seq={}",
+                            sender.user_id, rtp_hdr.seq);
+                    }
+                    return; // 키프레임 대기 중 — P-frame 드롭
+                }
+                RewriteResult::Skip => plaintext.clone(),
+            }
+        } else {
+            plaintext.clone()
+        };
+
         // Phase W-3: egress 큐로 전달 (DashMap iter 직접 순회, Vec 할당 없음)
         if is_detail {
             let target_info: Vec<String> = room.participants.iter()
@@ -163,7 +215,7 @@ impl UdpTransport {
             if entry.key() == &sender.user_id { continue; }
             let target = entry.value();
             if !target.is_subscribe_ready() { continue; }
-            if target.egress_tx.try_send(EgressPacket::Rtp(plaintext.clone())).is_err() {
+            if target.egress_tx.try_send(EgressPacket::Rtp(fanout_payload.clone())).is_err() {
                 self.metrics.egress_drop.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -248,11 +300,40 @@ impl UdpTransport {
             if pt == config::RTCP_PT_PSFB { self.metrics.pli_sent.fetch_add(1, Ordering::Relaxed); }
         }
 
+        // Phase E-4: PTT 모드에서 가상 SSRC → 원본 SSRC 변환
+        let ptt_audio_vssrc = if room.mode == RoomMode::Ptt {
+            Some(room.audio_rewriter.virtual_ssrc())
+        } else { None };
+        let ptt_video_vssrc = if room.mode == RoomMode::Ptt {
+            Some(room.video_rewriter.virtual_ssrc())
+        } else { None };
+
         // media_ssrc → publisher 매핑 + RTCP 블록 그룹핑
         let mut publisher_rtcp: HashMap<u32, Vec<&[u8]>> = HashMap::new();
         for block in &parsed.relay_blocks {
-            if block.media_ssrc == 0 { continue; } // RC=0 RR 등 media_ssrc 없는 경우 skip
-            publisher_rtcp.entry(block.media_ssrc)
+            if block.media_ssrc == 0 { continue; }
+            // PTT: 가상 SSRC로 도착한 RTCP는 현재 speaker의 원본 SSRC로 매핑
+            let effective_ssrc = if ptt_audio_vssrc == Some(block.media_ssrc)
+                || ptt_video_vssrc == Some(block.media_ssrc) {
+                // 현재 speaker의 해당 미디어 타입 원본 SSRC 찾기
+                let is_video = ptt_video_vssrc == Some(block.media_ssrc);
+                room.floor.current_speaker()
+                    .and_then(|uid| room.get_participant(&uid))
+                    .and_then(|p| {
+                        let tracks = p.tracks.lock().unwrap();
+                        tracks.iter()
+                            .find(|t| if is_video {
+                                t.kind == crate::room::participant::TrackKind::Video
+                            } else {
+                                t.kind == crate::room::participant::TrackKind::Audio
+                            })
+                            .map(|t| t.ssrc)
+                    })
+                    .unwrap_or(block.media_ssrc)
+            } else {
+                block.media_ssrc
+            };
+            publisher_rtcp.entry(effective_ssrc)
                 .or_default()
                 .push(&plaintext[block.offset..block.offset + block.length]);
         }
@@ -323,6 +404,15 @@ impl UdpTransport {
     ) {
         let nack_items = parse_rtcp_nack(nack_data);
 
+        // Phase E-4: PTT 모드 NACK 역매핑
+        // subscriber는 가상 SSRC/seq를 보지만 RtpCache는 원본 seq 기준
+        let is_ptt = room.mode == RoomMode::Ptt;
+        let ptt_virtual_video_ssrc = if is_ptt {
+            Some(room.video_rewriter.virtual_ssrc())
+        } else {
+            None
+        };
+
         for nack in &nack_items {
             let lost_seqs = expand_nack(nack.pid, nack.blp);
 
@@ -331,15 +421,37 @@ impl UdpTransport {
                     subscriber.user_id, nack.media_ssrc, nack.pid, nack.blp, lost_seqs);
             }
 
+            // PTT NACK 역매핑: 가상 SSRC로 NACK이 온 경우 원본 seq로 역산
+            let (lookup_ssrc, cache_seqs) = if ptt_virtual_video_ssrc == Some(nack.media_ssrc) {
+                // 가상 SSRC로 NACK 도착 → 현재 speaker의 원본 SSRC로 변환
+                self.metrics.ptt_nack_remapped.fetch_add(1, Ordering::Relaxed);
+                let original_seqs: Vec<u16> = lost_seqs.iter()
+                    .map(|&vs| room.video_rewriter.reverse_seq(vs))
+                    .collect();
+                // 현재 speaker의 원본 video SSRC 찾기
+                let speaker_ssrc = room.floor.current_speaker()
+                    .and_then(|uid| room.get_participant(&uid))
+                    .and_then(|p| {
+                        let tracks = p.tracks.lock().unwrap();
+                        tracks.iter()
+                            .find(|t| t.kind == crate::room::participant::TrackKind::Video)
+                            .map(|t| t.ssrc)
+                    })
+                    .unwrap_or(nack.media_ssrc);
+                (speaker_ssrc, original_seqs)
+            } else {
+                (nack.media_ssrc, lost_seqs.clone())
+            };
+
             // 해당 media_ssrc의 publisher 찾기 (zero-alloc DashMap iter)
-            let publisher = room.find_by_track_ssrc(nack.media_ssrc);
+            let publisher = room.find_by_track_ssrc(lookup_ssrc);
 
             let publisher = match publisher {
                 Some(p) => p,
                 None => {
                     self.metrics.nack_publisher_not_found.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
-                        debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", nack.media_ssrc);
+                        debug!("[DBG:NACK] publisher not found for ssrc=0x{:08X}", lookup_ssrc);
                     }
                     continue;
                 }
@@ -347,7 +459,7 @@ impl UdpTransport {
 
             // RTX SSRC 찾기
             let rtx_ssrc = publisher.get_tracks().iter()
-                .find(|t| t.ssrc == nack.media_ssrc)
+                .find(|t| t.ssrc == lookup_ssrc)
                 .and_then(|t| t.rtx_ssrc);
 
             let rtx_ssrc = match rtx_ssrc {
@@ -355,16 +467,16 @@ impl UdpTransport {
                 None => {
                     self.metrics.nack_no_rtx_ssrc.fetch_add(1, Ordering::Relaxed);
                     if is_detail {
-                        debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", nack.media_ssrc);
+                        debug!("[DBG:NACK] no rtx_ssrc for ssrc=0x{:08X}", lookup_ssrc);
                     }
                     continue;
                 }
             };
 
-            // 캐시 조회 + RTX 조립
+            // 캐시 조회 + RTX 조립 (원본 seq로 캐시 조회)
             let rtx_packets: Vec<(u16, u16, Vec<u8>)> = {
                 let cache = publisher.rtp_cache.lock().unwrap();
-                lost_seqs.iter().filter_map(|&lost_seq| {
+                cache_seqs.iter().filter_map(|&lost_seq| {
                     let original = cache.get(lost_seq)?;
                     let rtx_seq = publisher.next_rtx_seq();
                     let rtx_pkt = build_rtx_packet(original, rtx_ssrc, rtx_seq);
@@ -372,7 +484,7 @@ impl UdpTransport {
                 }).collect()
             };
 
-            let cache_miss = lost_seqs.len() - rtx_packets.len();
+            let cache_miss = cache_seqs.len() - rtx_packets.len();
             self.metrics.rtx_cache_miss.fetch_add(cache_miss as u64, Ordering::Relaxed);
             self.metrics.rtx_sent.fetch_add(rtx_packets.len() as u64, Ordering::Relaxed);
 
@@ -380,7 +492,7 @@ impl UdpTransport {
                 // 진단 로그: miss된 seq와 캐시 슬롯 상태 확인 (처음 10건)
                 if self.metrics.rtx_cache_miss.load(Ordering::Relaxed) <= 10 {
                     let cache = publisher.rtp_cache.lock().unwrap();
-                    let missed: Vec<String> = lost_seqs.iter()
+                    let missed: Vec<String> = cache_seqs.iter()
                         .filter(|&&s| rtx_packets.iter().all(|(ls, _, _)| *ls != s))
                         .take(3)
                         .map(|&s| {
@@ -394,7 +506,7 @@ impl UdpTransport {
                         })
                         .collect();
                     debug!("[DBG:RTX] MISS {}/{} ssrc=0x{:08X} user={} cached_3s={} samples=[{}]",
-                        cache_miss, lost_seqs.len(), nack.media_ssrc,
+                        cache_miss, cache_seqs.len(), lookup_ssrc,
                         publisher.user_id, self.metrics.rtp_cache_stored.load(Ordering::Relaxed), missed.join(", "));
                 }
             }
@@ -422,6 +534,15 @@ impl UdpTransport {
         room: &Arc<Room>,
         _is_detail: bool,
     ) {
+        // Phase E-1: PTT 모드에서는 floor holder의 SR만 릴레이
+        if room.mode == RoomMode::Ptt {
+            let allowed = match room.floor.current_speaker() {
+                Some(ref speaker) if speaker == &sender.user_id => true,
+                _ => false,
+            };
+            if !allowed { return; }
+        }
+
         self.metrics.sr_relayed.fetch_add(1, Ordering::Relaxed);
 
         // Phase W-3: egress 큐로 SR relay 전달 (DashMap iter 직접 순회, Vec 할당 없음)

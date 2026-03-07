@@ -125,6 +125,22 @@ pub(crate) struct GlobalMetrics {
     pub(crate) spawn_sr_relayed:    AtomicU64,
     pub(crate) spawn_encrypt_fail:  AtomicU64,
 
+    // ---- PTT (Phase E) ----
+    /// E-1 gate에서 드롭된 RTP 수 (비발화자 패킷)
+    pub(crate) ptt_rtp_gated:          AtomicU64,
+    /// E-2/E-4 리라이팅 성공한 RTP 수
+    pub(crate) ptt_rtp_rewritten:      AtomicU64,
+    /// E-4 키프레임 대기 중 드롭된 P-frame 수
+    pub(crate) ptt_video_pending_drop:  AtomicU64,
+    /// E-4 화자 전환 후 키프레임 도착 횟수
+    pub(crate) ptt_keyframe_arrived:    AtomicU64,
+    /// Floor Granted 횟수
+    pub(crate) ptt_floor_granted:       AtomicU64,
+    /// Floor Revoked (T2/PING 타임아웃) 횟수
+    pub(crate) ptt_floor_revoked:       AtomicU64,
+    /// NACK 역매핑 (가상SSRC→원본SSRC) 처리된 NACK 수
+    pub(crate) ptt_nack_remapped:       AtomicU64,
+
     // ---- Tokio RuntimeMetrics (flush 시점만, Mutex OK) ----
     tokio_snapshot: Mutex<TokioRuntimeSnapshot>,
 
@@ -166,6 +182,13 @@ impl GlobalMetrics {
             spawn_rtp_relayed:   AtomicU64::new(0),
             spawn_sr_relayed:    AtomicU64::new(0),
             spawn_encrypt_fail:  AtomicU64::new(0),
+            ptt_rtp_gated:          AtomicU64::new(0),
+            ptt_rtp_rewritten:      AtomicU64::new(0),
+            ptt_video_pending_drop: AtomicU64::new(0),
+            ptt_keyframe_arrived:   AtomicU64::new(0),
+            ptt_floor_granted:      AtomicU64::new(0),
+            ptt_floor_revoked:      AtomicU64::new(0),
+            ptt_nack_remapped:      AtomicU64::new(0),
             tokio_snapshot:  Mutex::new(TokioRuntimeSnapshot::new()),
             env_meta:        EnvironmentMeta::capture(worker_count, bwe_mode),
         }
@@ -233,6 +256,14 @@ impl GlobalMetrics {
         let spawn_rtp_relayed  = self.spawn_rtp_relayed.swap(0, Ordering::Relaxed);
         let spawn_sr_relayed   = self.spawn_sr_relayed.swap(0, Ordering::Relaxed);
         let spawn_encrypt_fail = self.spawn_encrypt_fail.swap(0, Ordering::Relaxed);
+        // PTT counters
+        let ptt_rtp_gated         = self.ptt_rtp_gated.swap(0, Ordering::Relaxed);
+        let ptt_rtp_rewritten     = self.ptt_rtp_rewritten.swap(0, Ordering::Relaxed);
+        let ptt_video_pending     = self.ptt_video_pending_drop.swap(0, Ordering::Relaxed);
+        let ptt_keyframe          = self.ptt_keyframe_arrived.swap(0, Ordering::Relaxed);
+        let ptt_granted           = self.ptt_floor_granted.swap(0, Ordering::Relaxed);
+        let ptt_revoked           = self.ptt_floor_revoked.swap(0, Ordering::Relaxed);
+        let ptt_nack_remap        = self.ptt_nack_remapped.swap(0, Ordering::Relaxed);
 
         // Tokio runtime (Mutex, 3초 1회)
         let tokio_json = self.tokio_snapshot.lock().unwrap().sample();
@@ -277,6 +308,16 @@ impl GlobalMetrics {
             "spawn_rtp_relayed":  spawn_rtp_relayed,
             "spawn_sr_relayed":   spawn_sr_relayed,
             "spawn_encrypt_fail": spawn_encrypt_fail,
+            // PTT
+            "ptt": {
+                "rtp_gated":         ptt_rtp_gated,
+                "rtp_rewritten":     ptt_rtp_rewritten,
+                "video_pending_drop":ptt_video_pending,
+                "keyframe_arrived":  ptt_keyframe,
+                "floor_granted":     ptt_granted,
+                "floor_revoked":     ptt_revoked,
+                "nack_remapped":     ptt_nack_remap,
+            },
             // environment & runtime
             "env":            env_json,
             "tokio_runtime":  tokio_json,

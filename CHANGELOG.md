@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.1] - 2026-03-08
+
+### Added (Phase E: PTT 미디어 파이프라인 — 게이팅 + SSRC 리라이팅 + 키프레임 대기)
+
+#### E-0: Floor Timer Task
+- `lib.rs` — `run_floor_timer()` 2초 주기 task (T2 max burst 30초 + T_FLOOR_TIMEOUT ping 미수신 5초 감시)
+- 타임아웃 시 FLOOR_REVOKE 전송 + FLOOR_IDLE 브로드캐스트 + rewriter 정리
+
+#### E-1: Relay Gate (미디어 게이팅)
+- `ingress.rs` — `handle_srtp` fan-out 직전 PTT 모드 가드: floor holder만 통과
+- `ingress.rs` — `relay_publish_rtcp` SR relay에도 동일 PTT 가드
+- Conference 모드 zero impact (`room.mode != Ptt`면 분기 안 탐)
+
+#### E-2: Audio SSRC Rewriting
+- `room/ptt_rewriter.rs` — PttRewriter 구조체 (오프셋 기반 상대 연산, 기술타당성검토서 §2.3)
+  - `new_audio()`: ts_guard_gap=960 (Opus 48kHz, 20ms), 키프레임 대기 없음
+  - `switch_speaker()` / `clear_speaker()`: 화자 전환 시 오프셋 갱신
+  - `rewrite()`: in-place RTP 헤더 덮어쓰기 (SSRC + seq + ts + marker bit)
+  - `reverse_seq()`: NACK 역매핑 (가상seq → 원본seq)
+- `room/room.rs` — Room에 `audio_rewriter: PttRewriter` 필드
+
+#### E-4: Video SSRC Rewriting + 키프레임 대기
+- `room/ptt_rewriter.rs` — `new_video()`: ts_guard_gap=3000 (VP8 90kHz, ~33ms), `pending_keyframe` 상태
+  - `RewriteResult` enum: Ok / PendingKeyframe / Skip
+  - `is_vp8_keyframe()`: VP8 payload descriptor 파싱으로 I-frame 감지 (RFC 7741)
+- `room/room.rs` — Room에 `video_rewriter: PttRewriter` 필드
+- `ingress.rs` — 비디오 RTP(PT=96 VP8) 리라이팅 + 키프레임 도착 전 P-frame 드롭
+- `ingress.rs` — NACK 역매핑: 가상SSRC NACK → 원본seq 역산 → RtpCache 조회
+- `ingress.rs` — subscribe RTCP relay: 가상SSRC → 원본SSRC 변환 (RR/PLI publisher 라우팅)
+
+#### PTT 메트릭 (7개 카운터)
+- `metrics/mod.rs` — GlobalMetrics에 PTT 전용 카운터 추가
+  - `ptt_rtp_gated`: E-1 gate에서 드롭된 비발화자 RTP 수
+  - `ptt_rtp_rewritten`: 리라이팅 성공 RTP 수
+  - `ptt_video_pending_drop`: 키프레임 대기 중 드롭된 P-frame 수
+  - `ptt_keyframe_arrived`: 화자 전환 후 키프레임 도착 횟수
+  - `ptt_floor_granted` / `ptt_floor_revoked`: Floor 상태 전환 횟수
+  - `ptt_nack_remapped`: 가상SSRC NACK 역매핑 횟수
+- flush JSON에 `"ptt"` 섹션으로 출력
+
+#### PTT 상태 스냅샷 (어드민)
+- `handler.rs` — `build_rooms_snapshot()`에 PTT 모드 room 정보 추가
+  - `floor_speaker`, `audio_virtual_ssrc`, `video_virtual_ssrc`
+
+### Changed
+- `state.rs` — AppState에 `Arc<GlobalMetrics>` 필드 추가 (handler에서 PTT 메트릭 접근용)
+  - `metrics` 필드 / `new()` → `pub(crate)` (가시성 정합)
+- `lib.rs` — GlobalMetrics 생성을 AppState 생성 전으로 이동 (metrics 전달 순서)
+- `signaling/handler.rs` — 5곳에서 audio_rewriter + video_rewriter 화자 전환/정리 호출
+  - handle_floor_request (Granted → switch_speaker)
+  - handle_floor_release (Released → clear_speaker)
+  - handle_room_leave (auto-release → clear_speaker)
+  - cleanup/disconnect (auto-release → clear_speaker)
+  - run_floor_timer (Revoked → clear_speaker)
+
 ## [0.5.0] - 2026-03-07
 
 ### Added (Floor Control — MCPTT/MBCP 기반 PTT 시그널링)

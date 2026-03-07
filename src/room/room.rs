@@ -28,6 +28,7 @@ use crate::config::RoomMode;
 use crate::error::{LightError, LightResult};
 use crate::room::participant::{Participant, PcType};
 use crate::room::floor::FloorController;
+use crate::room::ptt_rewriter::PttRewriter;
 
 // ============================================================================
 // Room
@@ -42,6 +43,11 @@ pub struct Room {
 
     /// Floor Control (PTT 모드에서만 활성)
     pub floor: FloorController,
+
+    /// PTT Audio SSRC Rewriter (PTT 모드에서만 사용)
+    pub audio_rewriter: PttRewriter,
+    /// PTT Video SSRC Rewriter (PTT 모드에서만 사용, 키프레임 대기)
+    pub video_rewriter: PttRewriter,
 
     /// Primary index: user_id → Participant
     pub participants: DashMap<String, Arc<Participant>>,
@@ -63,6 +69,8 @@ impl Room {
             mode,
             created_at,
             floor: FloorController::new(),
+            audio_rewriter: PttRewriter::new_audio(),
+            video_rewriter: PttRewriter::new_video(),
             participants: DashMap::new(),
             by_ufrag:     DashMap::new(),
             by_addr:      DashMap::new(),

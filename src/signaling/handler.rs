@@ -543,11 +543,13 @@ async fn handle_room_leave(session: &mut Session, state: &AppState, packet: &Pac
 
     let user_id = session.user_id.as_ref().unwrap();
 
-    // Floor: 발화자였으면 자동 release
+    // Floor: 발화자였으면 자동 release + rewriter 정리
     if let Ok(room) = state.rooms.get(&req.room_id) {
         if room.mode == RoomMode::Ptt {
             if let Some(action) = room.floor.on_participant_leave(user_id) {
                 apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+                room.audio_rewriter.clear_speaker();
+                room.video_rewriter.clear_speaker();
             }
         }
     }
@@ -662,9 +664,11 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
     let action = room.floor.request(user_id, now);
     let response = apply_floor_action(opcode::FLOOR_REQUEST, packet.pid, &action, &room, user_id);
 
-    // PTT Granted → publisher에게 PLI 전송 (soft mute 해제 시 키프레임부터 전송하도록)
-    // track.enabled=true 직후 Chrome encoder가 P-frame부터 보내는 문제 방지
+    // PTT Granted → audio rewriter 화자 전환 + PLI 전송
     if let FloorAction::Granted { speaker } = &action {
+        state.metrics.ptt_floor_granted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        room.audio_rewriter.switch_speaker(speaker);
+        room.video_rewriter.switch_speaker(speaker);
         if let Some(participant) = room.get_participant(speaker) {
             if participant.is_publish_ready() {
                 let video_ssrc = {
@@ -712,6 +716,13 @@ async fn handle_floor_release(session: &Session, state: &AppState, packet: &Pack
     }
 
     let action = room.floor.release(user_id);
+
+    // Release/Released 시 rewriter 정리
+    if matches!(&action, FloorAction::Released { .. }) {
+        room.audio_rewriter.clear_speaker();
+        room.video_rewriter.clear_speaker();
+    }
+
     apply_floor_action(opcode::FLOOR_RELEASE, packet.pid, &action, &room, user_id)
 }
 
@@ -817,11 +828,13 @@ fn apply_floor_action(
 
 async fn cleanup(session: &Session, state: &AppState) {
     if let (Some(room_id), Some(user_id)) = (&session.current_room, &session.user_id) {
-        // Floor: 발화자였으면 자동 release (disconnect 시)
+        // Floor: 발화자였으면 자동 release + rewriter 정리 (disconnect 시)
         if let Ok(room) = state.rooms.get(room_id) {
             if room.mode == RoomMode::Ptt {
                 if let Some(action) = room.floor.on_participant_leave(user_id) {
                     apply_floor_action(opcode::FLOOR_RELEASE, 0, &action, &room, user_id);
+                    room.audio_rewriter.clear_speaker();
+                    room.video_rewriter.clear_speaker();
                 }
             }
         }
@@ -1088,12 +1101,22 @@ fn build_rooms_snapshot(state: &AppState) -> serde_json::Value {
                     })
                 })
                 .collect();
-            serde_json::json!({
+            let mut room_json = serde_json::json!({
                 "room_id": &room.id,
                 "name": &room.name,
                 "capacity": room.capacity,
+                "mode": room.mode.to_string(),
                 "participants": participants,
-            })
+            });
+            // PTT 모드일 때 분석용 상태 정보 추가
+            if room.mode == RoomMode::Ptt {
+                room_json["ptt"] = serde_json::json!({
+                    "floor_speaker": room.floor.current_speaker(),
+                    "audio_virtual_ssrc": format!("0x{:08X}", room.audio_rewriter.virtual_ssrc()),
+                    "video_virtual_ssrc": format!("0x{:08X}", room.video_rewriter.virtual_ssrc()),
+                });
+            }
+            room_json
         })
         .collect();
 

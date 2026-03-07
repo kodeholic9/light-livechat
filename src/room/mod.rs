@@ -4,3 +4,4 @@
 pub mod room;
 pub mod participant;
 pub mod floor;
+pub mod ptt_rewriter;
