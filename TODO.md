@@ -112,7 +112,7 @@
 - [x] RR relay metrics 카운터 버그 수정 — v0.3.4
 - [x] transport-wide-cc extmap 제거 (TWCC 구현 전 REMB 모드) — v0.3.4
 - [x] SDK jitterBufferDelay delta 계산 전환 — v0.3.4
-- [ ] TWCC feedback 생성 (서버, REMB 대체)
+- [x] TWCC feedback 생성 (서버, REMB 대체) — v0.3.8
 - [ ] VP8 키프레임 캐시 (LRU) 검토
   - RTP payload에서 VP8 I-frame 감지 (RFC 7741 descriptor + bit0)
   - publisher별 마지막 키프레임 RTP 패킷 묶음(same timestamp) 캐시
@@ -152,7 +152,7 @@
 - [x] W-2 Conference 벤치마크 (30인 0.1%, 35인 17.8%) — v0.3.6
 - [x] W-3 Conference 벤치마크 (30인 0%, 35인 7%, 40인 22.8%) — v0.3.7
 - [ ] x86 서버 벤치마크 (50인+ 목표)
-- [ ] TWCC 구현 후 전후 벤치마크 비교
+- [ ] TWCC 전후 벤치마크 비교 (Chrome BWE 반응 확인, v0.3.8 vs v0.3.4)
 
 ## Backlog
 - [ ] Simulcast / SVC (layer detection, adaptive quality)

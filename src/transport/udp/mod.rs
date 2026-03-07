@@ -21,6 +21,7 @@ mod metrics;
 mod rtcp;
 mod ingress;
 mod egress;
+pub(crate) mod twcc;
 
 // Re-exports for external use
 pub use rtcp::build_pli;
@@ -186,10 +187,10 @@ impl UdpTransport {
         );
         metrics_timer.tick().await;
 
-        let mut remb_timer = tokio::time::interval(
-            tokio::time::Duration::from_millis(config::REMB_INTERVAL_MS),
+        let mut twcc_timer = tokio::time::interval(
+            tokio::time::Duration::from_millis(config::TWCC_FEEDBACK_INTERVAL_MS),
         );
-        remb_timer.tick().await;
+        twcc_timer.tick().await;
 
         loop {
             tokio::select! {
@@ -218,8 +219,8 @@ impl UdpTransport {
                 _ = metrics_timer.tick(), if is_primary => {
                     self.flush_metrics();
                 }
-                _ = remb_timer.tick(), if is_primary => {
-                    self.send_remb_to_publishers().await;
+                _ = twcc_timer.tick(), if is_primary => {
+                    self.send_twcc_to_publishers().await;
                 }
             }
         }

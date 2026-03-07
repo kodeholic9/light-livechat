@@ -81,6 +81,19 @@ pub const REMB_INTERVAL_MS: u64 = 1_000;
 /// 서버 REMB 권장 비트레이트 (bps) — Chrome BWE의 상한 힌트
 pub const REMB_BITRATE_BPS: u64 = 500_000;
 
+// --- TWCC (Transport-Wide Congestion Control) ---
+/// TWCC RTP header extension ID (서버 extmap 정책과 일치해야 함)
+pub const TWCC_EXTMAP_ID: u8 = 6;
+/// TwccRecorder 링버퍼 크기 (twcc_seq % SIZE 인덱싱)
+/// 약 4초분 @2000pps. 128KB per participant.
+pub const TWCC_RECORDER_CAPACITY: usize = 8192;
+/// TWCC feedback RTCP payload type (RFC 8888 이전 draft 기반, Chrome 호환)
+pub const RTCP_PT_RTPFB: u8 = 205;
+/// TWCC feedback message type (FMT=15)
+pub const RTCP_FMT_TWCC: u8 = 15;
+/// TWCC feedback 전송 주기 (ms)
+pub const TWCC_FEEDBACK_INTERVAL_MS: u64 = 100;
+
 // --- Debug ---
 /// RTP/RELAY hot-path: 상세 로그 출력 패킷 수 (이후 SUMMARY_INTERVAL마다 요약)
 pub const DBG_DETAIL_LIMIT: u64 = 50;

@@ -18,6 +18,7 @@ use tracing::trace;
 
 use crate::config;
 use crate::transport::srtp::SrtpContext;
+use crate::transport::udp::twcc::TwccRecorder;
 
 // ============================================================================
 // EgressPacket — subscriber egress task에 전달할 plaintext 패킷
@@ -219,6 +220,10 @@ pub struct Participant {
     /// RTX 패킷 전용 seq 카운터 (subscriber별이 아닌 publisher별)
     pub rtx_seq: AtomicU16,
 
+    // --- TWCC (Transport-Wide Congestion Control) ---
+    /// Publisher RTP의 twcc seq → 도착 시간 기록 (feedback 생성용)
+    pub twcc_recorder: Mutex<TwccRecorder>,
+
     // --- Egress (Phase W-3: subscriber별 egress task) ---
     /// subscribe PC egress channel — plaintext를 egress task에 전달
     pub egress_tx: mpsc::Sender<EgressPacket>,
@@ -252,6 +257,7 @@ impl Participant {
             subscribe:  MediaSession::new(sub_ufrag, sub_pwd),
             tracks:     Mutex::new(Vec::new()),
             rtp_cache:  Mutex::new(RtpCache::new()),
+            twcc_recorder: Mutex::new(TwccRecorder::new()),
             rtx_ssrc_counter: AtomicU32::new(0),
             rtx_seq:    AtomicU16::new(0),
             egress_tx,

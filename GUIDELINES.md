@@ -121,8 +121,9 @@ src/
 │   └── udp/                Single-port UDP loop + RoomHub integration
 │       ├── mod.rs           UdpTransport 본체 + run() + STUN + DTLS + worker
 │       ├── ingress.rs       Publish RTP/RTCP 수신 (hot path)
-│       ├── egress.rs        Subscriber 송신 (egress task, PLI, REMB)
+│       ├── egress.rs        Subscriber 송신 (egress task, PLI, TWCC)
 │       ├── rtcp.rs          RTCP/RTP 파싱·조립 헬퍼 (NACK, RTX, PLI, REMB)
+│       ├── twcc.rs          TWCC 도착 시간 기록 + feedback RTCP 빌더
 │       └── metrics.rs       B구간 계측 (TimingStat, ServerMetrics)
 ├── media/
 │   ├── router.rs           SSRC routing table
@@ -211,6 +212,7 @@ async-trait = "0.1"
 | W-1 | Fan-out spawn (tokio::spawn 분리, 30인 PASS) | 0.3.5 | ✅ |
 | W-2 | Multi-worker (SO_REUSEPORT, 30인 0.1%) | 0.3.6 | ✅ |
 | W-3 | Subscriber Egress Task (LiveKit 패턴, 30인 0%/15ms) | 0.3.7 | ✅ |
+| TW | TWCC Transport-Wide Congestion Control (REMB 대체) | 0.3.8 | ✅ |
 | E | PTT 지원 | 0.4.x | |
 | — | Simulcast / SVC (optional) | 0.3.x | |
 
@@ -285,6 +287,15 @@ async-trait = "0.1"
 - 서버: tracks_update / ROOM_JOIN 응답에 rtx_ssrc 포함
 - 클라이언트: subscribe SDP에 `ssrc-group:FID` + RTX SSRC 선언
 - publisher 관여 없이 서버에서 직접 재전송 (RTT 절반)
+
+### v0.3.8 — TWCC Transport-Wide Congestion Control
+- 서버: `transport/udp/twcc.rs` 신규 모듈 (parse_twcc_seq + TwccRecorder + build_twcc_feedback)
+- RTP one-byte header extension에서 twcc seq# 추출, publisher별 도착 시간 링버퍼(8192슬롯) 기록
+- 100ms 주기 TWCC feedback RTCP 전송 (REMB 1초 타이머 대체)
+- 2-bit status vector chunk + recv_delta 인코딩 (draft-holmer-rmcat-transport-wide-cc)
+- `server_extmap_policy()`: transport-wide-cc extmap id=6 활성화
+- Chrome GCC delay gradient 분석 → 비트레이트 자율 결정 (고정 REMB 500kbps 대체)
+- REMB 코드 fallback용 보존 (`#[allow(dead_code)]`)
 
 ### v0.3.4 — Media Quality (REMB + RR relay fix + JB delta)
 - 서버 자체 REMB 생성 (1초 주기) — Chrome BWE 대역폭 힌트

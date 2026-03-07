@@ -304,6 +304,8 @@ pub fn build_pli(media_ssrc: u32) -> [u8; 12] {
 ///
 /// Chrome의 goog-remb rtcp_fb에 대응. 서버가 publisher에게
 /// "이 만큼까지 보내도 된다"는 대역폭 힌트를 제공한다.
+/// TWCC 활성화 후 사용하지 않지만, TWCC 불가 시 fallback용으로 보존.
+#[allow(dead_code)]
 pub(crate) fn build_remb(bitrate_bps: u64, media_ssrc: u32) -> [u8; 24] {
     let mut buf = [0u8; 24];
 
@@ -344,6 +346,7 @@ pub(crate) fn build_remb(bitrate_bps: u64, media_ssrc: u32) -> [u8; 24] {
 
 /// REMB 비트레이트 인코딩: bps → (exp, mantissa)
 /// mantissa * 2^exp = bps, mantissa는 18비트 이하
+#[allow(dead_code)]
 fn encode_remb_bitrate(bps: u64) -> (u8, u32) {
     let mut exp: u8 = 0;
     let mut mantissa = bps;

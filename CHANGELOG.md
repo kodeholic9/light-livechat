@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.8] - 2026-03-07
+
+### Added (Phase TW: TWCC Transport-Wide Congestion Control)
+
+#### 서버
+- **`transport/udp/twcc.rs`** 신규 모듈
+  - `parse_twcc_seq(buf, extmap_id)` — RTP one-byte header extension에서 twcc seq# 추출
+  - `TwccRecorder` — publisher별 twcc_seq → 도착 Instant 링버퍼 기록 (8192슬롯)
+  - `build_twcc_feedback(recorder, media_ssrc)` — TWCC feedback RTCP 빌더
+    - 2-bit status vector chunk (7 symbols/chunk)
+    - recv_delta 인코딩 (small 1byte / large 2bytes, ×250µs)
+    - reference_time 24-bit signed (×64ms), fb_pkt_count 자동 증가
+    - pending_base 자동 전진 + 범위 초과 안전 가드
+- `participant.rs`: `twcc_recorder: Mutex<TwccRecorder>` 필드 추가
+- `ingress.rs`: hot path에 twcc seq 추출 + 도착 시간 기록 (Mutex 1회, O(1))
+- `egress.rs`: `send_twcc_to_publishers()` — 100ms 주기 TWCC feedback 전송
+- `config.rs`: `TWCC_EXTMAP_ID`(6), `TWCC_RECORDER_CAPACITY`(8192), `TWCC_FEEDBACK_INTERVAL_MS`(100) 등 6개 상수
+
+### Changed
+- `server_extmap_policy()`: transport-wide-cc extmap id=6 활성화
+- REMB 타이머(1초) → TWCC 타이머(100ms)로 교체
+- `send_remb_to_publishers()` → `send_twcc_to_publishers()` 전환
+- `build_remb()` / `encode_remb_bitrate()` — `#[allow(dead_code)]` fallback 보존
+
+### 목적
+- Chrome GCC가 패킷 도착 시간 변화(delay gradient)를 분석하여 비트레이트 자율 결정
+- 고정 REMB(500kbps) 대비 네트워크 상태 적응적 비트레이트 제어
+- 업계 표준 congestion control 경로 (LiveKit, mediasoup 동일 패턴)
+
+### 서버 Telemetry 연동
+- `metrics.rs`: `twcc_sent` / `twcc_recorded` 카운터 — 3초 윈도우 flush
+- `ingress.rs`: twcc record 성공 시 `twcc_recorded` 증가
+- `egress.rs`: feedback 전송 성공 시 `twcc_sent` 증가
+
+### 어드민 대시보드
+- Contract 체크리스트: `twcc_feedback` — ⚠️ WARN(미구현) → ✅ PASS (`twcc_sent > 0`)
+- SFU 패널 RTCP grid: `twcc_fb` / `twcc_rec` 카운터 표시
+- 스냅샷: `twcc_fb` / `twcc_rec` 필드 포함
+
+### 유닛테스트
+- twcc.rs: 17개 (파서 5 + recorder 3 + chunk 3 + delta 3 + feedback 통합 4)
+- 전체: 34개 PASS
+
 ## [0.3.7] - 2026-03-07
 
 ### Changed (udp.rs 모듈 분할 리팩토링)

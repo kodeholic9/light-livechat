@@ -77,6 +77,7 @@ pub(crate) struct ServerMetrics {
     pub(crate) sr_relayed:     u64,
     pub(crate) rr_relayed:     u64,
     pub(crate) twcc_sent:      u64,
+    pub(crate) twcc_recorded:   u64,
     // subscribe RTCP 진단 카운터
     pub(crate) sub_rtcp_received: u64,
     pub(crate) sub_rtcp_not_rtcp: u64,
@@ -103,6 +104,7 @@ impl ServerMetrics {
             sr_relayed:     0,
             rr_relayed:     0,
             twcc_sent:      0,
+            twcc_recorded:   0,
             sub_rtcp_received: 0,
             sub_rtcp_not_rtcp: 0,
             sub_rtcp_decrypted: 0,
@@ -140,6 +142,7 @@ impl ServerMetrics {
             "sr_relayed":     self.sr_relayed,
             "rr_relayed":     self.rr_relayed,
             "twcc_sent":      self.twcc_sent,
+            "twcc_recorded":   self.twcc_recorded,
             "sub_rtcp_received": self.sub_rtcp_received,
             "sub_rtcp_not_rtcp": self.sub_rtcp_not_rtcp,
             "sub_rtcp_decrypted": self.sub_rtcp_decrypted,
@@ -164,6 +167,7 @@ impl ServerMetrics {
         self.sr_relayed = 0;
         self.rr_relayed = 0;
         self.twcc_sent = 0;
+        self.twcc_recorded = 0;
         self.sub_rtcp_received = 0;
         self.sub_rtcp_not_rtcp = 0;
         self.sub_rtcp_decrypted = 0;

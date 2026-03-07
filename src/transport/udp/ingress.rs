@@ -21,6 +21,7 @@ use super::rtcp::{
     parse_rtp_header, current_ts, split_compound_rtcp, parse_rtcp_nack,
     expand_nack, build_rtx_packet, assemble_compound,
 };
+use super::twcc;
 
 impl UdpTransport {
     /// SRTP hot path — publish RTP decrypt → fan-out to subscriber egress queues
@@ -119,6 +120,14 @@ impl UdpTransport {
         if rtp_hdr.pt == 96 {
             if let Ok(mut cache) = sender.rtp_cache.lock() {
                 cache.store(rtp_hdr.seq, &plaintext);
+            }
+        }
+
+        // TWCC: transport-wide seq# 추출 + 도착 시간 기록
+        if let Some(twcc_seq) = twcc::parse_twcc_seq(&plaintext, config::TWCC_EXTMAP_ID) {
+            if let Ok(mut rec) = sender.twcc_recorder.lock() {
+                rec.record(twcc_seq, Instant::now());
+                self.metrics.twcc_recorded += 1;
             }
         }
 
