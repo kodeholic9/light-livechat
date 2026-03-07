@@ -660,7 +660,39 @@ async fn handle_floor_request(session: &Session, state: &AppState, packet: &Pack
 
     let now = current_ts();
     let action = room.floor.request(user_id, now);
-    apply_floor_action(opcode::FLOOR_REQUEST, packet.pid, &action, &room, user_id)
+    let response = apply_floor_action(opcode::FLOOR_REQUEST, packet.pid, &action, &room, user_id);
+
+    // PTT Granted → publisher에게 PLI 전송 (soft mute 해제 시 키프레임부터 전송하도록)
+    // track.enabled=true 직후 Chrome encoder가 P-frame부터 보내는 문제 방지
+    if let FloorAction::Granted { speaker } = &action {
+        if let Some(participant) = room.get_participant(speaker) {
+            if participant.is_publish_ready() {
+                let video_ssrc = {
+                    let tracks = participant.tracks.lock().unwrap();
+                    tracks.iter()
+                        .find(|t| t.kind == TrackKind::Video)
+                        .map(|t| t.ssrc)
+                };
+                if let (Some(ssrc), Some(pub_addr)) = (video_ssrc, participant.publish.get_address()) {
+                    let pli_plain = crate::transport::udp::build_pli(ssrc);
+                    let encrypted = {
+                        let mut ctx = participant.publish.outbound_srtp.lock().unwrap();
+                        ctx.encrypt_rtcp(&pli_plain).ok()
+                    };
+                    if let Some(enc) = encrypted {
+                        let socket = &state.udp_socket;
+                        if let Err(e) = socket.send_to(&enc, pub_addr).await {
+                            warn!("[FLOOR] PLI send FAILED user={} ssrc=0x{:08X}: {e}", speaker, ssrc);
+                        } else {
+                            info!("[FLOOR] PLI sent user={} ssrc=0x{:08X} (floor granted)", speaker, ssrc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    response
 }
 
 async fn handle_floor_release(session: &Session, state: &AppState, packet: &Packet) -> Packet {

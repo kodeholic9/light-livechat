@@ -111,6 +111,7 @@ pub(crate) struct GlobalMetrics {
     pub(crate) rr_relayed:      AtomicU64,
     pub(crate) twcc_sent:       AtomicU64,
     pub(crate) twcc_recorded:   AtomicU64,
+    pub(crate) remb_sent:       AtomicU64,
     pub(crate) sub_rtcp_received:   AtomicU64,
     pub(crate) sub_rtcp_not_rtcp:   AtomicU64,
     pub(crate) sub_rtcp_decrypted:  AtomicU64,
@@ -153,6 +154,7 @@ impl GlobalMetrics {
             rr_relayed:      AtomicU64::new(0),
             twcc_sent:       AtomicU64::new(0),
             twcc_recorded:   AtomicU64::new(0),
+            remb_sent:       AtomicU64::new(0),
             sub_rtcp_received:   AtomicU64::new(0),
             sub_rtcp_not_rtcp:   AtomicU64::new(0),
             sub_rtcp_decrypted:  AtomicU64::new(0),
@@ -219,6 +221,7 @@ impl GlobalMetrics {
         let rr_relayed     = self.rr_relayed.swap(0, Ordering::Relaxed);
         let twcc_sent      = self.twcc_sent.swap(0, Ordering::Relaxed);
         let twcc_recorded  = self.twcc_recorded.swap(0, Ordering::Relaxed);
+        let remb_sent      = self.remb_sent.swap(0, Ordering::Relaxed);
         let sub_rtcp_received  = self.sub_rtcp_received.swap(0, Ordering::Relaxed);
         let sub_rtcp_not_rtcp  = self.sub_rtcp_not_rtcp.swap(0, Ordering::Relaxed);
         let sub_rtcp_decrypted = self.sub_rtcp_decrypted.swap(0, Ordering::Relaxed);
@@ -262,6 +265,7 @@ impl GlobalMetrics {
             "rr_relayed":         rr_relayed,
             "twcc_sent":          twcc_sent,
             "twcc_recorded":      twcc_recorded,
+            "remb_sent":          remb_sent,
             "sub_rtcp_received":  sub_rtcp_received,
             "sub_rtcp_not_rtcp":  sub_rtcp_not_rtcp,
             "sub_rtcp_decrypted": sub_rtcp_decrypted,

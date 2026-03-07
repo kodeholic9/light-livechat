@@ -120,6 +120,8 @@ impl UdpTransport {
 
                 if let Err(e) = self.socket.send_to(&encrypted, pub_addr).await {
                     debug!("[REMB] send FAILED user={} addr={}: {e}", publisher.user_id, pub_addr);
+                } else {
+                    self.metrics.remb_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
